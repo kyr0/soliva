@@ -56,7 +56,12 @@ function DebugPanel() {
         Kamera <b id="cam-coords">-, -</b><span class="sep">|</span>
         MiniMap <b id="hover-coords">-, -</b>
       </div>
-      <div>FPS <b id="fps">0</b></div>
+      <div>
+        FPS <b id="fps">0</b><span class="sep">|</span>
+        Minimap <b id="minimap-fps">0</b><span class="sep">|</span>
+        {/* Bild = Billboards (Menü → Grafik → Bäume als Bild), 3D = Modelle. */}
+        Bäume <b id="billboards">3D</b>
+      </div>
     </div>
   );
 }
@@ -184,6 +189,9 @@ function Minimap() {
       <RingSlot deg={225} id="minimap-save" />
       <RingSlot deg={315} id="minimap-menu" />
       <RingSlot deg={135}><SoundButton /></RingSlot>
+      <RingSlot deg={112}>
+        <div id="zoom-level" class="minimap-zoom" title="Zoomstufe - Mausrad oder Q / E">Zoom 3</div>
+      </RingSlot>
       <RingSlot deg={55}>
         <button type="button" id="turn-left" title="Ansicht gegen den Uhrzeigersinn drehen"><TurnIcon /></button>
       </RingSlot>

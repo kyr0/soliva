@@ -1,7 +1,8 @@
 // DevPanel.ts
 // Die Entwickler-Infos oben links (components/Hud.tsx): Position, Abtastung,
-// Zoom, das Tile und was unter dem Zeiger steht, Kamera, Minimap-Zeiger und
-// Bilder je Sekunde. Texte werden nur gesetzt, wenn sie sich ändern - sonst
+// Zoom, das Tile und was unter dem Zeiger steht, Kamera, Minimap-Zeiger,
+// Bilder je Sekunde (Spiel und Minimap) und ob Bäume als Bild (Billboard)
+// gezeichnet werden. Texte werden nur gesetzt, wenn sie sich ändern - sonst
 // rechnete der Browser je Bild das Layout neu.
 
 import type { TileType } from '../noise';
@@ -28,11 +29,18 @@ export class DevPanel {
   private camera = byId('cam-coords');
   private minimap = byId('hover-coords');
   private fps = byId('fps');
+  private minimapFps = byId('minimap-fps');
+  private minimapFrames = 0;
+  private billboards = byId('billboards');
   private frames = 0;
   private lastFps = performance.now();
 
-  /** Je Bild: Kamera-Position und Abtastung; alle FPS_INTERVAL ms die Bilder je Sekunde. */
-  frame(now: number, camera: Camera) {
+  /**
+   * Je Bild: Kamera-Position, Abtastung und ob Bäume als Bild gezeichnet
+   * wurden; alle FPS_INTERVAL ms die Bilder je Sekunde.
+   */
+  frame(now: number, camera: Camera, billboards: boolean) {
+    setText(this.billboards, billboards ? 'Bild' : '3D');
     const center = `${Math.round(camera.x)}, ${Math.round(camera.y)}`;
     setText(this.pos, center);
     setText(this.camera, center);
@@ -40,13 +48,21 @@ export class DevPanel {
     this.frames++;
     if (now - this.lastFps >= FPS_INTERVAL) {
       setText(this.fps, String(Math.round((this.frames * 1000) / (now - this.lastFps))));
+      setText(this.minimapFps, String(Math.round((this.minimapFrames * 1000) / (now - this.lastFps))));
+      this.minimapFrames = 0;
       this.frames = 0;
       this.lastFps = now;
     }
   }
 
-  showZoom(tileSize: number) {
-    setText(this.zoom, `${tileSize}px`);
+  /** Die Minimap wurde gezeichnet - für ihre Bilder je Sekunde. */
+  minimapFrame() {
+    this.minimapFrames++;
+  }
+
+  showZoom(camera: Camera) {
+    // Beim weichen Zoomen liegt die Größe zwischen den Stufen - gerundet.
+    setText(this.zoom, `${camera.zoomNumber} (${Math.round(camera.tileSize * 10) / 10}px)`);
   }
 
   /** Tile unter dem Zeiger mit seinen Gelände-Werten - oder keins. */

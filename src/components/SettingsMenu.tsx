@@ -1,7 +1,7 @@
 // SettingsMenu.tsx
 // Menü als Holztafel in der Bildmitte (Zahnrad an der Rohstoffleiste oder
 // F10, wie in AoE2): Spielerfarbe, Pause, Tempo, Ton und Musik, Kamera-Tempo,
-// Anzeigen, Speichern, zurück ins Hauptmenü. Einmal gerendert; refresh()
+// Anzeigen, Grafik, Speichern, zurück ins Hauptmenü. Einmal gerendert; refresh()
 // setzt über Refs, was sich auch von außen ändert (Pause, Ton, laufendes
 // Musikstück).
 
@@ -9,7 +9,9 @@ import { createRef, render, type Ref } from 'defuss';
 import './SettingsMenu.css';
 import woodBar from '../icons/wood-bar.png';
 import { PLAYER_COLORS } from '../world/catalog';
-import { resetSettings, saveSettings, type Settings } from '../settings';
+import { ANIMALS_BELOW_DEFAULT, resetSettings, saveSettings, type Settings } from '../settings';
+import { ANIMAL_CLASSES } from '../world/unit';
+import { ZOOM_LEVELS } from '../game/Camera';
 import { ShortcutList } from './Shortcuts';
 import { confirmDialog } from './ConfirmDialog';
 
@@ -31,6 +33,23 @@ export interface MenuHooks {
 }
 
 const SPEEDS: [number, string][] = [[1, 'Normal'], [1.5, 'Schnell'], [2, 'Sehr schnell']];
+/**
+ * Wahl "bis Zoom N": Aus oder eine der Zoomstufen (Zoom 1 = weit draußen).
+ * Gespeichert wird die Grenze in CSS-Pixeln je Tile, unter der es gilt - die
+ * doppelte Pixelzahl der gewählten Stufe (Zoom 1 = 8 px → 16).
+ */
+function zoomChoices(off: string, upTo: (zoom: string) => string): [number, string, string][] {
+  return [
+    [0, 'Aus', off],
+    ...ZOOM_LEVELS.map((px, i): [number, string, string] => [px * 2, String(i + 1), upTo(i === 0 ? 'Zoom 1' : `Zoom 1 bis ${i + 1}`)]),
+  ];
+}
+/** Bäume als Bild bis zu dieser Zoomstufe - weit draußen sind Bäume nur noch wenige Pixel groß. */
+const BILLBOARDS = zoomChoices('Bäume immer als 3D-Modell', (z) => `Bäume als Bild bei ${z}`);
+/** Eine Tierart ausblenden bis zu dieser Zoomstufe. */
+const HIDE_ANIMALS = zoomChoices('Immer zeigen', (z) => `Ausblenden bei ${z}`);
+/** Die Tierarten in der Reihenfolge der Klassen: Kennung und Name. */
+const ANIMAL_KINDS = ANIMAL_CLASSES.map((c) => [c.definition.type, c.definition.label] as const);
 
 /** Regler 0..100 % mit der Zahl daneben. */
 interface SliderRefs {
@@ -58,6 +77,8 @@ export class SettingsMenu {
   private pauseButton = createRef<HTMLButtonElement>();
   private soundButton = createRef<HTMLButtonElement>();
   private speedButtons = SPEEDS.map(() => createRef<HTMLButtonElement>());
+  private billboardButtons = BILLBOARDS.map(() => createRef<HTMLButtonElement>());
+  private animalButtons = new Map(ANIMAL_KINDS.map(([kind]) => [kind, HIDE_ANIMALS.map(() => createRef<HTMLButtonElement>())]));
   private colorButtons = new Map(Object.keys(PLAYER_COLORS).map((key) => [key, createRef<HTMLButtonElement>()]));
   private volume = sliderRefs();
   private music = sliderRefs();
@@ -65,6 +86,8 @@ export class SettingsMenu {
   private track = createRef<HTMLSpanElement>();
   private showHelp = createRef<HTMLInputElement>();
   private showDebug = createRef<HTMLInputElement>();
+  private idleFps = createRef<HTMLInputElement>();
+  private minimapFps = createRef<HTMLInputElement>();
   /** Nur im Spiel: Hauptmenü, Pause, Speichern, Weiter spielen - aus dem Hauptmenü heraus stattdessen Zurück. */
   private pauseRow = createRef<HTMLDivElement>();
   private gameButtons = createRef<HTMLDivElement>();
@@ -170,6 +193,57 @@ export class SettingsMenu {
           </label>
         </section>
         <section>
+          <h3>Grafik</h3>
+          <div class="menu-row">
+            <span title="Bäume als flaches Bild statt als 3D-Modell - weit draußen sieht man kaum einen Unterschied, das Spiel läuft aber flüssiger.">Bäume als Bild bis Zoom</span>
+            <span class="menu-choice">
+              {BILLBOARDS.map(([value, label, hint], i) => (
+                <button type="button" class="wood-btn" title={hint} ref={this.billboardButtons[i]} onClick={() => this.change({ billboards: value })}>{label}</button>
+              ))}
+            </span>
+          </div>
+          <p class="menu-hint">
+            Bis zu dieser Zoomstufe (1 = weit draußen, 5 = ganz nah) werden Bäume als flaches Bild statt als
+            3D-Modell gezeichnet - das Spiel läuft flüssiger, weit draußen sieht man kaum einen Unterschied.
+            {import.meta.env.DEV ? ' Entwicklermodus: die Bilder liegen in tools/export/out/billboards/.' : ''}
+          </p>
+          <details class="menu-keys-box">
+            <summary title="Weit draußen sind Tiere kaum zu sehen - ausgeblendet läuft das Spiel flüssiger. Sie leben trotzdem weiter.">Tiere ausblenden bis Zoom</summary>
+            {ANIMAL_KINDS.map(([kind, name]) => (
+              <div class="menu-row">
+                <span>{name}</span>
+                <span class="menu-choice">
+                  {HIDE_ANIMALS.map(([value, label, hint], i) => (
+                    <button type="button" class="wood-btn" title={hint} ref={this.animalButtons.get(kind)![i]}
+                      onClick={() => this.change({ animalsBelow: { ...this.settings.animalsBelow, [kind]: value } })}>{label}</button>
+                  ))}
+                </span>
+              </div>
+            ))}
+            <p class="menu-hint">
+              Bis zu dieser Zoomstufe wird die Tierart nicht gezeichnet - die Tiere leben trotzdem weiter.
+            </p>
+          </details>
+          <label class="menu-row">
+            <span>Im Stillstand 30 FPS</span>
+            <input type="checkbox" ref={this.idleFps}
+              onInput={(e: Event) => this.change({ idleFps: (e.target as HTMLInputElement).checked })} />
+          </label>
+          <p class="menu-hint">
+            Steht die Kamera eine Sekunde still, zeichnet das Spiel nur noch 30 Bilder je Sekunde - schont Akku
+            und Lüfter. Beim Verschieben, Zoomen oder Drehen sofort wieder volle Bildrate.
+          </p>
+          <label class="menu-row">
+            <span>Minimap mit 10 FPS</span>
+            <input type="checkbox" ref={this.minimapFps}
+              onInput={(e: Event) => this.change({ minimapFps: (e.target as HTMLInputElement).checked })} />
+          </label>
+          <p class="menu-hint">
+            Die Minimap wird nur 10-mal je Sekunde gezeichnet - sie bewegt sich langsam, man sieht es kaum.
+            Aus: so oft wie das Spiel.
+          </p>
+        </section>
+        <section>
           <div class="menu-row">
             <span>Alle Einstellungen</span>
             <button type="button" class="wood-btn menu-btn" onClick={() => this.reset()}>Zurücksetzen</button>
@@ -234,6 +308,11 @@ export class SettingsMenu {
     this.pauseButton.current.textContent = this.hooks.paused() ? 'Fortsetzen' : 'Anhalten';
     this.soundButton.current.textContent = this.hooks.soundEnabled() ? 'An' : 'Aus';
     SPEEDS.forEach(([value], i) => this.speedButtons[i].current.classList.toggle('active', value === s.speed));
+    BILLBOARDS.forEach(([value], i) => this.billboardButtons[i].current.classList.toggle('active', value === s.billboards));
+    for (const [kind, refs] of this.animalButtons) {
+      const below = s.animalsBelow[kind] ?? ANIMALS_BELOW_DEFAULT;
+      HIDE_ANIMALS.forEach(([value], i) => refs[i].current.classList.toggle('active', value === below));
+    }
     for (const [key, ref] of this.colorButtons) ref.current.classList.toggle('active', key === s.playerColor);
     const slider = (refs: SliderRefs, v: number) => {
       refs.input.current.value = String(Math.round(v * 100));
@@ -246,6 +325,8 @@ export class SettingsMenu {
     this.track.current.textContent = title ? `♪ ${title}` : 'Musik beginnt mit dem ersten Klick';
     this.showHelp.current.checked = s.showHelp;
     this.showDebug.current.checked = s.showDebug;
+    this.idleFps.current.checked = s.idleFps;
+    this.minimapFps.current.checked = s.minimapFps;
   }
 
   /** Alle Einstellungen auf ihre Vorgaben - nach Rückfrage. */

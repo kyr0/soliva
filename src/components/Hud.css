@@ -359,6 +359,20 @@
   left: -16px;
   top: -16px;
 }
+/* Zoomstufe außen am Reif zwischen Süden und dem Ton: "Zoom 1" bis "Zoom 5". */
+.minimap-zoom {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  font: 700 13px Georgia, 'Times New Roman', serif;
+  letter-spacing: 0.04em;
+  color: #e7d3a3;
+  text-shadow: 0 1px 2px #000;
+  white-space: nowrap;
+  cursor: default;
+}
 #sound .off {
   display: none;
 }

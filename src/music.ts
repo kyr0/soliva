@@ -5,7 +5,9 @@
 // statt ganz in den Speicher dekodiert zu werden.
 //
 // Browser erlauben Ton erst nach einer Nutzeraktion - die Musik beginnt darum
-// beim ersten Klick oder Tastendruck.
+// beim ersten Klick oder Tastendruck. Steht sie später (abgelehnt, oder die
+// Seite kam per Zurück aus dem Browser-Cache und wurde dabei angehalten),
+// läuft sie beim nächsten Klick oder Tastendruck weiter.
 
 /** Anzeige-Titel je Datei (assets/music/<name>.mp3) - sonst aus dem Dateinamen. */
 const TITLES: Record<string, string> = {
@@ -53,19 +55,39 @@ export class Music {
         if (p === this.players[this.current] && !this.fade) this.next();
       });
     }
-    const start = () => {
-      window.removeEventListener('pointerdown', start);
-      window.removeEventListener('keydown', start);
-      this.started = true;
-      if (TRACKS.length > 0) this.next();
-    };
-    window.addEventListener('pointerdown', start);
-    window.addEventListener('keydown', start);
+    // Jede Nutzeraktion - in der Capture-Phase, damit kein stopPropagation
+    // sie verschluckt. Safari zählt pointerdown nicht immer als Aktion, click
+    // und touchend schon.
+    const resume = () => this.resume();
+    for (const type of ['pointerdown', 'keydown', 'click', 'touchend']) {
+      window.addEventListener(type, resume, { capture: true });
+    }
+    // Zurück aus dem Browser-Cache: gleich versuchen - ohne neue Nutzeraktion
+    // lässt der Browser das oft schon zu, sonst beim nächsten Klick.
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted && this.started) this.resume();
+    });
     const tick = () => {
       this.updateFade();
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
+  }
+
+  /** Beim ersten Mal beginnen, danach das laufende Stück fortsetzen, falls es steht. */
+  private resume() {
+    if (TRACKS.length === 0) return;
+    if (!this.started) {
+      this.started = true;
+      this.next();
+      return;
+    }
+    const player = this.players[this.current];
+    if (player.paused && player.src) {
+      void player.play().catch(() => {
+        // Noch nicht erlaubt - beim nächsten Klick erneut.
+      });
+    }
   }
 
   /** Titel des Stücks, das gerade läuft (Dateiname), oder null. */
@@ -103,7 +125,7 @@ export class Music {
     to.currentTime = 0;
     to.volume = 0;
     void to.play().catch(() => {
-      // Abgelehnt (noch keine Nutzeraktion) - beim nächsten Wechsel erneut.
+      // Abgelehnt (noch keine Nutzeraktion) - resume() versucht es beim nächsten Klick.
     });
     this.fade = { start: performance.now(), from, to };
   }

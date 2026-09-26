@@ -16,8 +16,10 @@ const TITLE_DRIFT = 24;
  * Ein Bild weiter. true, wenn sich die Ansicht bewegt hat - dann liegt unter
  * dem stehenden Zeiger anderes Gelände.
  * @param scrollSpeed Kamera-Tempo aus den Einstellungen (1 = normal)
+ * @param flatten Gelände flachlegen wie mit gehaltener Leertaste
  */
-export function steerCamera(camera: Camera, renderer: MapRenderer, keyboard: Keyboard, dt: number, scrollSpeed: number, onTitle: boolean): boolean {
+export function steerCamera(camera: Camera, renderer: MapRenderer, keyboard: Keyboard, dt: number, scrollSpeed: number, onTitle: boolean,
+                            flatten = false): boolean {
   // Gescrollt wird in Bildschirmrichtung, nicht entlang der Weltachsen - die
   // liegen in der Rautenansicht diagonal. Das Tempo ist in Tiles je Sekunde
   // gleich, aber auf 3200 Pixel je Sekunde gedeckelt: ganz nah heran zoomt
@@ -33,8 +35,9 @@ export function steerCamera(camera: Camera, renderer: MapRenderer, keyboard: Key
   if (onTitle) dx += TITLE_DRIFT * dt;
 
   // Leertaste halten: Relief sinkt flach, um hinter Berge zu sehen. Weich
-  // überblendet, damit man sieht, was wohin gehört.
-  const target = keyboard.isDown(' ') ? FLAT_RELIEF : 1;
+  // überblendet, damit man sieht, was wohin gehört. `flatten`: dasselbe von
+  // selbst, wenn Gelände den angeschauten Punkt verdeckt (main.ts, autoFlat).
+  const target = keyboard.isDown(' ') || flatten ? FLAT_RELIEF : 1;
   const before = renderer.relief;
   renderer.relief += (target - renderer.relief) * Math.min(1, dt * 10);
   if (Math.abs(target - renderer.relief) < 0.002) renderer.relief = target;

@@ -1,7 +1,9 @@
 // Baut aus einer Szene (render.ts) eine .glb-Datei (glTF 2.0, binär): eine
 // Datei mit eingebetteten Texturen, die Blender direkt importiert
-// (File > Import > glTF 2.0). Meter und y nach oben wie im Modell; je Batch
-// ein Primitive mit eigenem Material.
+// (File > Import > glTF 2.0). Meter und y nach oben wie im Modell; je Objekt
+// (Trunk, Trunk.Stump, Branch ...) ein Knoten mit seinem Namen - das Spiel
+// erkennt die Teile daran (doppelte Namen mit "#2" ..., tools/models/glb.mjs) -,
+// darin je Material ein Primitive.
 import type { Scene, Texture } from './render.ts';
 
 const GLB_MAGIC = 0x46546c67;
@@ -102,9 +104,8 @@ export async function buildGlb(scene: Scene, name: string): Promise<Blob> {
   };
 
   const materials: GltfMaterial[] = [];
-  const primitives: { attributes: Record<string, number>; mode: number; material: number }[] = [];
   for (const batch of scene.batches) {
-    const { look, first, count } = batch;
+    const { look } = batch;
     let material: GltfMaterial;
     if ('texture' in look) {
       material = {
@@ -126,19 +127,38 @@ export async function buildGlb(scene: Scene, name: string): Promise<Blob> {
         pbrMetallicRoughness: { baseColorFactor: [...linear(look.color), 1], metallicFactor: 0, roughnessFactor: 0.9 },
       };
     }
+    materials.push(material);
+  }
+
+  type Primitive = { attributes: Record<string, number>; mode: number; material: number };
+  const objects = new Map<number, { name: string; primitives: Primitive[] }>();
+  for (const { name: objectName, object, batch, first, count } of scene.parts) {
     // glTF: Textur-Ursprung oben links, OBJ: v = 0 unten - v spiegeln.
     const uvs = scene.uvs.slice(first * 2, (first + count) * 2);
     for (let i = 1; i < uvs.length; i += 2) uvs[i] = 1 - uvs[i];
-    primitives.push({
+    let entry = objects.get(object);
+    if (!entry) objects.set(object, (entry = { name: objectName, primitives: [] }));
+    entry.primitives.push({
       attributes: {
         POSITION: addAccessor(scene.positions.slice(first * 3, (first + count) * 3), 'VEC3', true),
         NORMAL: addAccessor(normalized(scene.normals, first, count), 'VEC3', false),
         TEXCOORD_0: addAccessor(uvs, 'VEC2', false),
       },
       mode: TRIANGLES,
-      material: materials.push(material) - 1,
+      material: batch,
     });
   }
+  const meshes: { name: string; primitives: Primitive[] }[] = [];
+  const nodes: { name: string; mesh?: number; children?: number[] }[] = [];
+  const seen = new Map<string, number>();
+  for (const { name: objectName, primitives } of [...objects.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1])) {
+    const n = (seen.get(objectName) ?? 0) + 1;
+    seen.set(objectName, n);
+    const nodeName = n === 1 ? objectName : `${objectName}#${n}`;
+    nodes.push({ name: nodeName, mesh: meshes.push({ name: nodeName, primitives }) - 1 });
+  }
+  // Ein Wurzelknoten mit dem Namen des Baums hält die Teile zusammen.
+  nodes.push({ name, children: nodes.map((_, i) => i) });
 
   const json = {
     asset: { version: '2.0', generator: 'procedurally-generated-map tools/lsystem' },
@@ -147,9 +167,9 @@ export async function buildGlb(scene: Scene, name: string): Promise<Blob> {
     accessors,
     ...(samplers.length ? { samplers, images, textures } : {}),
     materials,
-    meshes: [{ name, primitives }],
-    nodes: [{ name, mesh: 0 }],
-    scenes: [{ nodes: [0] }],
+    meshes,
+    nodes,
+    scenes: [{ nodes: [nodes.length - 1] }],
     scene: 0,
   };
   return new Blob([glb(json, binParts, binLength)], { type: 'model/gltf-binary' });

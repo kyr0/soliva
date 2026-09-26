@@ -38,6 +38,13 @@ export const CONTROLS: readonly Control[] = [
     keys: ['q', 'e'], run: (c, e) => c.zoom(e.key.toLowerCase() === 'e' ? 1 : -1),
   },
   { label: ['Leertaste'], what: 'Halten: Gelände flach', short: 'flach' },
+  // Alt: auf dem Mac Option, unter Windows auch AltGr (keyboard.ts, MouseInput.ts).
+  {
+    label: ['Alt', MOUSE_RIGHT, '~ziehen'], sep: '+',
+    what: 'Blickwinkel: hoch/runter neigen, links/rechts in Vierteln drehen (Mac: Option)', short: 'Winkel',
+  },
+  { label: ['Alt', '↑', '↓'], sep: '+', what: 'Steiler / flacher neigen', short: 'neigen' },
+  { label: ['Alt', '←', '→'], sep: '+', what: 'Vierteldrehung nach links / rechts', short: 'drehen' },
   // H wie in AoE2 - "Home".
   { label: ['H'], what: 'Zum Hauptgebäude', short: 'Hauptgebäude', keys: ['h'], run: (c) => c.home() },
   { label: [MOUSE_LEFT], what: 'Auswählen (Ziehen: Rahmen)', short: 'auswählen' },

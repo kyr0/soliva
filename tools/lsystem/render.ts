@@ -35,11 +35,23 @@ export interface Batch {
   readonly count: number;
 }
 
+/** Ein Objekt (`o` im OBJ) innerhalb eines Batches - für den glTF-Export. */
+export interface Part {
+  /** Name im OBJ (Trunk, Trunk.Stump, Branch ...) und Nummer des Objekts. */
+  readonly name: string;
+  readonly object: number;
+  /** Index in Scene.batches. */
+  readonly batch: number;
+  readonly first: number;
+  readonly count: number;
+}
+
 export interface Scene {
   readonly positions: Float32Array;
   readonly normals: Float32Array;
   readonly uvs: Float32Array;
   readonly batches: readonly Batch[];
+  readonly parts: readonly Part[];
   readonly triangles: number;
   /** Höchster Punkt und Kronenradius in Metern - für Bildausschnitt und Boden. */
   readonly top: number;
@@ -57,16 +69,18 @@ export function sceneFromObj(lines: readonly string[], look: (material: string) 
   const vertices: Vec3[] = [];
   const uvList: [number, number][] = [];
   const normalList: Vec3[] = [];
-  interface Face { look: Look; verts: Vec3[]; uvs: ([number, number] | undefined)[]; normals: (Vec3 | undefined)[] }
+  interface Face { look: Look; object: number; verts: Vec3[]; uvs: ([number, number] | undefined)[]; normals: (Vec3 | undefined)[] }
   const faces: Face[] = [];
   let current: Look = { color: FALLBACK };
   const names = new Map<Look, string>();
+  const objects: string[] = [];
   let triangles = 0;
   for (const line of lines) {
     const [kind, ...rest] = line.split(' ');
     if (kind === 'v') vertices.push([Number(rest[0]), Number(rest[1]), Number(rest[2])]);
     else if (kind === 'vt') uvList.push([Number(rest[0]), Number(rest[1])]);
     else if (kind === 'vn') normalList.push([Number(rest[0]), Number(rest[1]), Number(rest[2])]);
+    else if (kind === 'o') objects.push(rest.join(' '));
     else if (kind === 'usemtl') {
       current = look(rest[0]) ?? { color: FALLBACK };
       if (!names.has(current)) names.set(current, rest[0]);
@@ -75,6 +89,7 @@ export function sceneFromObj(lines: readonly string[], look: (material: string) 
       const refs = rest.map((ref) => ref.split('/'));
       faces.push({
         look: current,
+        object: Math.max(0, objects.length - 1),
         verts: refs.map((r) => vertices[Number(r[0]) - 1]),
         uvs: refs.map((r) => uvList[Number(r[1]) - 1]),
         normals: refs.map((r) => normalList[Number(r[2]) - 1]),
@@ -97,9 +112,20 @@ export function sceneFromObj(lines: readonly string[], look: (material: string) 
     cursor.set(batchLook, first);
     first += count;
   }
+  // Innerhalb eines Batches liegen die Flächen eines Objekts beieinander.
+  const order = [...counts.keys()];
+  const sorted = faces.toSorted((a, b) => order.indexOf(a.look) - order.indexOf(b.look) || a.object - b.object);
+  const parts: Part[] = [];
   let top = 0.1, radius = 0.1;
-  for (const f of faces) {
+  for (const f of sorted) {
     let at = cursor.get(f.look) ?? 0;
+    const batch = order.indexOf(f.look);
+    const part = parts.at(-1);
+    if (part && part.batch === batch && part.object === f.object) {
+      parts[parts.length - 1] = { ...part, count: part.count + (f.verts.length - 2) * 3 };
+    } else {
+      parts.push({ name: objects[f.object] ?? 'Object', object: f.object, batch, first: at, count: (f.verts.length - 2) * 3 });
+    }
     const [a, b, c] = [f.verts[0], f.verts[1], f.verts[2]];
     // Flache Normale der Fläche - die Seiten sind nicht einheitlich gewunden,
     // der Shader dreht sie zum Auge.
@@ -121,7 +147,7 @@ export function sceneFromObj(lines: readonly string[], look: (material: string) 
     }
     cursor.set(f.look, at);
   }
-  return { positions, normals, uvs, batches, triangles, top, radius };
+  return { positions, normals, uvs, batches, parts, triangles, top, radius };
 }
 
 // --- WebGL: ein gemeinsamer Kontext für alle Vorschauen ---------------------

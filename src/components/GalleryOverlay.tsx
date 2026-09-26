@@ -36,6 +36,8 @@ export interface GalleryElements {
   titles: HTMLDivElement[];
   /** Zeigt, was gewählt ist: Modell (-1 = Übersicht), Animation und ob der Zusatz läuft. */
   show(item: number, animation: number, extra: boolean): void;
+  /** Die Dateien der gezeigten Modelle (src/models) unter dem Namen. */
+  files(names: readonly string[]): void;
 }
 
 /**
@@ -50,6 +52,7 @@ export function mountGallery(root: HTMLElement, items: GalleryItem[], labels: st
   const allRef = createRef<HTMLButtonElement>();
   const stage = createRef<HTMLDivElement>();
   const heading = createRef<HTMLDivElement>();
+  const fileLine = createRef<HTMLDivElement>();
   const chips = createRef<HTMLDivElement>();
 
   const groups = [...new Set(items.map((it) => it.group))];
@@ -80,6 +83,7 @@ export function mountGallery(root: HTMLElement, items: GalleryItem[], labels: st
       {/* Unten: Name, Animationen, Drehen - nur für ein einzelnes Modell. */}
       <div class="gal-stage" ref={stage}>
         <div class="gal-heading" ref={heading} />
+        <div class="gal-file" ref={fileLine} />
         <div class="gal-chips" ref={chips} />
         <div class="gal-rotate">
           <button type="button" class="wood-btn" title="Links herum drehen" onClick={() => hooks.rotate(-1)}>⟲</button>
@@ -123,5 +127,9 @@ export function mountGallery(root: HTMLElement, items: GalleryItem[], labels: st
     labels: labelRefs.map((r) => r.current),
     titles: titleRefs.map((r) => r.current),
     show,
+    files: (names) => {
+      const text = names.join(' · ');
+      if (fileLine.current.textContent !== text) fileLine.current.textContent = text;
+    },
   };
 }

@@ -1,12 +1,13 @@
 import { MAX_FLAT_ZONES, packZones, type FlatZone } from './world/flatten';
 import { Color, type RGB } from './functions/Color';
-import { EntityRenderer, type EntityInstance } from './gl/entityRenderer';
-import { TerrainRenderer } from './gl/terrainRenderer';
+import { EntityRenderer, type EntityInstance, type StaticBatch } from './gl/entityRenderer';
+import { FLOWER_OBJECT_PIXELS, TerrainRenderer } from './gl/terrainRenderer';
 import {
   screenToGround,
   setViewElevation,
   snapCamera,
   viewElevation,
+  viewGroundV,
   visibleWorldRect,
   type IsoView,
 } from './gl/iso';
@@ -80,7 +81,13 @@ export const RESOURCE_TYPE_COLORS: Record<ResourceType, Color> = {
  * erste legt grob fest, in welcher Gegend etwas vorkommt, das zweite teilt die
  * Gegend in kleine Vorkommen von einigen Tiles - wie in AoE2 ein paar
  * Beerensträucher oder ein Häufchen Stein statt einer ganzen Wiese voll.
- * Die Menge ist (r + 1) * yield, abgerundet.
+ * `threshold: -Infinity` heißt: in jeder Gegend - jeder Wald trägt Holz, und
+ * Beeren gibt es auf der ganzen Wiese. Die Menge ist (r + 1) * yield,
+ * abgerundet, mindestens yield (r unter 0 zählt wie 0).
+ *
+ * Mit `clump` statt Häufchen-Rauschen: runde Gruppen dicht an dicht, je eine
+ * in manchen Zellen eines Rasters (siehe ResourceClump) - Beerensträucher
+ * stehen so zusammen wie in AoE2, statt als lange Streifen.
  *
  * Die Reihenfolge ist Teil der Regel - die erste passende gewinnt. Gold steht
  * deshalb vor Stein: beide liegen im Gebirge, Gold nur in der oberen Spitze
@@ -93,17 +100,63 @@ export interface ResourceRule {
   biome: TileType;
   type: Exclude<ResourceType, "none">;
   threshold: number;
-  /** Schwelle fürs Häufchen-Rauschen (-1..1); unter -1 zählt es nicht (Wälder). */
+  /**
+   * Schwelle fürs Häufchen-Rauschen (-1..1); unter -1 zählt es nicht (Wälder).
+   * Mit `clump` ist der Wert 1 in der Mitte einer Gruppe und 0 an ihrem Rand.
+   */
   cluster: number;
   yield: number;
+  clump?: ResourceClump;
+}
+
+/**
+ * Gruppen statt Häufchen-Rauschen: Die Welt ist in Zellen von `cell` Tiles
+ * geteilt; mit der Wahrscheinlichkeit `chance` liegt in einer Zelle eine
+ * runde Gruppe mit Radius `radius` Tiles (bei 1,5 sind das 6-9 Tiles), ganz
+ * innerhalb der Zelle - so bleiben zwischen den Gruppen Wege frei.
+ */
+export interface ResourceClump {
+  cell: number;
+  radius: number;
+  chance: number;
 }
 
 export const RESOURCE_RULES: readonly ResourceRule[] = [
-  { biome: "forest", type: "wood", threshold: 0.15, cluster: -2, yield: 50 },
+  { biome: "forest", type: "wood", threshold: -Infinity, cluster: -2, yield: 50 },
   { biome: "mountain", type: "gold", threshold: 0.4, cluster: 0.75, yield: 40 },
   { biome: "mountain", type: "stone", threshold: 0.1, cluster: 0.72, yield: 40 },
-  { biome: "grass", type: "berries", threshold: 0.3, cluster: 0.7, yield: 30 },
+  {
+    biome: "grass", type: "berries", threshold: -Infinity, cluster: 0, yield: 30,
+    clump: { cell: 12, radius: 1.5, chance: 0.3 },
+  },
 ];
+
+/** Deterministischer Zufall 0..1 je Zelle, Kanal und Welt. */
+function cellHash(x: number, y: number, channel: number, seed: number): number {
+  let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(channel, 2246822519) ^ seed;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+/** Wert der Gruppe am Tile (x, y): 1 in der Mitte, 0 am Rand, darunter außerhalb. */
+export function clumpValue(x: number, y: number, clump: ResourceClump, seed: number): number {
+  const cx = Math.floor(x / clump.cell);
+  const cy = Math.floor(y / clump.cell);
+  if (cellHash(cx, cy, 0, seed) >= clump.chance) return -1;
+  // Mitte so, dass die ganze Gruppe in der Zelle liegt.
+  const margin = clump.radius + 1;
+  const span = clump.cell - 2 * margin;
+  const mx = cx * clump.cell + margin + cellHash(cx, cy, 1, seed) * span;
+  const my = cy * clump.cell + margin + cellHash(cx, cy, 2, seed) * span;
+  return 1 - Math.hypot(x + 0.5 - mx, y + 0.5 - my) / clump.radius;
+}
+
+/** Zahl aus dem Namen der Welt - für clumpValue(). */
+function seedNumber(seed: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 16777619);
+  return h;
+}
 
 /**
  * Maßstab des Häufchen-Rauschens: ein Vorkommen misst einige Tiles. Jede
@@ -115,7 +168,7 @@ const RESOURCE_CLUSTER_OFFSET = [40, 68] as const;
 
 /**
  * Wertet RESOURCE_RULES aus - erste passende Regel gewinnt. `cluster(i)` ist
- * das Häufchen-Rauschen für Regel i an diesem Tile.
+ * das Häufchen-Rauschen (bzw. der Wert der Gruppe) für Regel i an diesem Tile.
  */
 export function resourceFromNoise(
   tileType: TileType,
@@ -125,7 +178,7 @@ export function resourceFromNoise(
   for (let i = 0; i < RESOURCE_RULES.length; i++) {
     const rule = RESOURCE_RULES[i];
     if (rule.biome === tileType && r > rule.threshold && (rule.cluster < -1 || cluster(i) > rule.cluster)) {
-      return { type: rule.type, amount: Math.floor((r + 1) * rule.yield) };
+      return { type: rule.type, amount: Math.floor((Math.max(r, 0) + 1) * rule.yield) };
     }
   }
   return { type: "none", amount: 0 };
@@ -253,19 +306,25 @@ export const TERRAIN_PALETTE = {
 export class Terrain {
   private resourceNoise: FractalNoise;
   private clusterNoise: SimplexNoise;
+  private clumpSeed: number;
 
   constructor(private mapGen: MapGenerator, seed: string) {
     // Wenige Oktaven + niedrige Frequenz: Ressourcen sollen zusammenhängende
     // Vorkommen bilden, kein Konfetti über die ganze Karte.
     this.resourceNoise = new FractalNoise(new SimplexNoise(seed + "_resources"), 2, 0.5, 2);
     this.clusterNoise = new SimplexNoise(seed + "_resource_clusters");
+    this.clumpSeed = seedNumber(seed + "_resource_clumps");
   }
 
-  /** Häufchen-Rauschen für Regel `rule` an Tile (x, y). */
+  /** Häufchen-Rauschen bzw. Wert der Gruppe für Regel `rule` an Tile (x, y). */
   private cluster(x: number, y: number) {
-    return (rule: number) => this.clusterNoise.noise2D(
-        x * RESOURCE_CLUSTER_SCALE + rule * RESOURCE_CLUSTER_OFFSET[0],
-        y * RESOURCE_CLUSTER_SCALE + rule * RESOURCE_CLUSTER_OFFSET[1]);
+    return (rule: number) => {
+      const clump = RESOURCE_RULES[rule].clump;
+      if (clump) return clumpValue(x, y, clump, this.clumpSeed + rule);
+      return this.clusterNoise.noise2D(
+          x * RESOURCE_CLUSTER_SCALE + rule * RESOURCE_CLUSTER_OFFSET[0],
+          y * RESOURCE_CLUSTER_SCALE + rule * RESOURCE_CLUSTER_OFFSET[1]);
+    };
   }
 
   private generateResources(tile: MapTile): { type: ResourceType; amount: number } {
@@ -292,6 +351,9 @@ export class Terrain {
   }
 }
 
+/** Kleinste Zoomstufe in CSS-Pixeln je Tile (siehe game/Camera.ts) - kleiner wird nichts vorberechnet. */
+const MIN_TILE_SIZE = 1;
+
 /**
  * Hauptansicht in isometrischer 3D-Sicht. Das Gelände entsteht komplett auf der
  * GPU, die Gebäude kommen als zweiter, instanzierter Durchgang darüber.
@@ -305,6 +367,35 @@ export class MapRenderer {
    * würde ihn neu befüllen.
    */
   relief = 1;
+  /**
+   * CSS-Pixel je Tile, in denen der Gelände-Cache gerade berechnet ist. Beim
+   * weichen Zoomen bleibt er stehen und wird nur gestreckt - neu berechnet
+   * wird erst, wenn die Zoomstufe erreicht ist, oder beim Herauszoomen, sobald
+   * der Cache das Bild nicht mehr abdeckt.
+   */
+  private cacheTileSize = 0;
+  /**
+   * CSS-Pixel je Tile am Zoomziel (siehe Camera.targetTileSize). Liegt es
+   * über der Stufe des Caches, wird die Zielstufe schon vorberechnet, während
+   * der Zoom noch hingleitet.
+   */
+  targetTileSize = 0;
+  /**
+   * Wird gerade geneigt? Dann bleibt der Gelände-Cache auf seiner
+   * Bodenstauchung und wird nur gestreckt; neu berechnet wird, wenn der
+   * Blickwinkel steht - oder wenn die Streckung zu groß wird.
+   */
+  tilting = false;
+  /** Bodenstauchung, für die der Gelände-Cache gerade berechnet ist (0 = noch keine). */
+  private cacheGroundV = 0;
+
+  /**
+   * Stehen die Blumen als 3D-Objekte in der Wiese? Hängt an der Stufe des
+   * Gelände-Caches, nicht am Zoom: so malt er sie nie zugleich als Tupfen.
+   */
+  get flowerObjects(): boolean {
+    return this.cacheTileSize * this.pixelRatio >= FLOWER_OBJECT_PIXELS;
+  }
 
   constructor(
       canvas: HTMLCanvasElement,
@@ -324,6 +415,25 @@ export class MapRenderer {
     this.entities.playerColor = rgb;
   }
 
+  /** Feste Puffer für Instanzen, die sich nicht ändern (world/resources.ts). */
+  createBatch(instances: readonly EntityInstance[]): StaticBatch {
+    return this.entities.createBatch(instances);
+  }
+
+  deleteBatch(batch: StaticBatch) {
+    this.entities.deleteBatch(batch);
+  }
+
+  /** Unter so vielen CSS-Pixeln je Tile zeichnen Bäume als Bild (0: nie) - Einstellung "Bäume als Bild". */
+  set billboardBelow(cssPixelsPerTile: number) {
+    this.entities.billboardBelow = cssPixelsPerTile;
+  }
+
+  /** Ob im letzten Bild Bäume als Bild gezeichnet wurden. */
+  get billboardsActive(): boolean {
+    return this.entities.billboardsActive;
+  }
+
   /** Umgepflügte Äcker für den Gelände-Shader (siehe TerrainRenderer.setFields). */
   setFields(x: number, y: number, data: Uint8Array | null) {
     this.terrain.setFields(x, y, data);
@@ -339,18 +449,39 @@ export class MapRenderer {
     this.entities.flatCount = count;
   }
 
+  /** false, wenn in diesem Bild nichts gezeichnet wurde - dann steht noch das letzte. */
   render(
       centerX: number,
       centerY: number,
       mouseTileX?: number,
       mouseTileY?: number,
       overlay: EntityInstance[] = [],
-  ) {
+      batches: readonly StaticBatch[] = [],
+  ): boolean {
     const canvas = this.terrain.context.canvas;
+    // Auf einer Zoomstufe (Zweierpotenz) genau so fein wie das Bild; dazwischen
+    // die bisherige Stufe, höchstens aber die nächstkleinere - deren Cache
+    // deckt das ganze Bild ab.
+    const level = 2 ** Math.floor(Math.log2(this.tileSize) + 1e-9);
+    this.cacheTileSize = level === this.tileSize ? level : Math.min(this.cacheTileSize || level, level);
+    // Beim Neigen: flacher gesehen deckt der gestreckte Cache nur so weit ab,
+    // wie seine Blase reicht (bis 1,25), steiler wird er unscharf (ab 1/1,6).
+    const groundV = viewGroundV();
+    const stretch = this.cacheGroundV / groundV;
+    if (!this.tilting || !this.cacheGroundV || stretch > 1.25 || stretch < 1 / 1.6) this.cacheGroundV = groundV;
+    // Die Stufe, auf der der Zoom zur Ruhe kommen wird.
+    const goal = 2 ** Math.ceil(Math.log2(this.targetTileSize || this.tileSize) - 1e-9);
     const camera = snapCamera({
       centerX,
       centerY,
       pixelsPerTile: this.tileSize * this.pixelRatio,
+      cachePixelsPerTile: this.cacheTileSize * this.pixelRatio,
+      cacheGroundV: this.cacheGroundV,
+      // Beim Hineinzoomen zuerst die Zielstufe, damit sie beim Ankommen fertig
+      // ist; die zwei nächstkleineren liegen so beim Herauszoomen bereit.
+      prefetchPixelsPerTile: [...(goal > this.cacheTileSize ? [goal] : []), this.cacheTileSize / 2, this.cacheTileSize / 4]
+          .filter((t) => t >= MIN_TILE_SIZE)
+          .map((t) => t * this.pixelRatio),
       reliefScale: this.relief,
     }, canvas.width, canvas.height);
 
@@ -359,11 +490,13 @@ export class MapRenderer {
         ? { x: mouseTileX, y: mouseTileY }
         : null;
 
-    this.terrain.render(camera);
+    // Nichts gezeichnet: das letzte Bild bleibt stehen - ohne Figuren darüber.
+    if (!this.terrain.render(camera)) return false;
     // Mindestens acht Geräte-Pixel: kleiner wird ein Gebäude auf der
     // herausgezoomten Karte zum Einzelpunkt und ist nicht mehr zu erkennen.
     this.entities.groundStep = this.terrain.gridCell;
-    this.entities.render(overlay, camera, 8 / camera.pixelsPerTile, this.pixelRatio, true);
+    this.entities.render(overlay, camera, 8 / camera.pixelsPerTile, this.pixelRatio, true, batches);
+    return true;
   }
 }
 
@@ -428,7 +561,10 @@ export class MiniMap {
 
   /** u-Einheiten, die die Minimap waagerecht abdeckt. */
   private coverage(view: IsoView): number {
-    return Math.min(Math.max((view.width / view.tileSize) * MiniMap.OVERVIEW, MiniMap.MIN_COVERAGE), MiniMap.MAX_COVERAGE);
+    // Auf die nächste Zoomstufe gerundet: beim weichen Zoomen würde sich der
+    // Maßstab sonst je Bild ändern und die Minimap jedes Mal neu berechnet.
+    const tileSize = 2 ** Math.round(Math.log2(view.tileSize));
+    return Math.min(Math.max((view.width / tileSize) * MiniMap.OVERVIEW, MiniMap.MIN_COVERAGE), MiniMap.MAX_COVERAGE);
   }
 
   /** Dieselbe Mitte wie die Hauptansicht, in CSS-Pixeln der Minimap. */
@@ -461,7 +597,8 @@ export class MiniMap {
         width: w,
         height: h,
       };
-      this.terrain.render(camera);
+      // Nichts gezeichnet: das letzte Bild bleibt stehen - ohne Figuren darüber.
+      if (!this.terrain.render(camera)) return;
       // Auf der Minimap zählt nur, dass überhaupt etwas dasteht - vier Pixel
       // reichen dafür, die Form ist auf dieser Größe ohnehin nicht zu erkennen.
       this.entities.render(overlay, camera, 4 / camera.pixelsPerTile);

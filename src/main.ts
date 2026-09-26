@@ -1,15 +1,25 @@
 
 import { MapGenerator } from './noise';
 import {
+  TILT_DEFAULT,
+  TILT_MAX,
+  TILT_MIN,
+  centerFor,
+  pickWorld,
+  setViewElevation,
   type IsoView,
+  viewElevation,
+  viewRotation,
+  viewZScreen,
   visibleWorldRect,
+  worldToGround,
 } from './gl/iso';
 import {
   MapRenderer,
   MiniMap,
   Terrain,
 } from './map';
-import type { EntityInstance } from './gl/entityRenderer';
+import type { EntityInstance, StaticBatch } from './gl/entityRenderer';
 import { setAnimationSpeed, setAnimationsPaused } from './gl/entityRenderer';
 import {
   player,
@@ -26,7 +36,7 @@ import { FixedStep, Interval } from './game/timing';
 import { Pointer } from './game/Pointer';
 import { DevPanel } from './game/DevPanel';
 import { Keyboard } from './game/keyboard';
-import { MouseInput } from './game/MouseInput';
+import { MouseInput, type CanvasPoint } from './game/MouseInput';
 import { PlayerActions } from './game/actions';
 import { Placement } from './game/Placement';
 import { Picker, RESOURCE_OBJECTS_MIN_ZOOM } from './game/Picker';
@@ -39,8 +49,9 @@ import { minimapDots, placementOverlay, selectionOverlay } from './game/overlay'
 import { mountGame } from './components/Hud';
 import { SettingsMenu } from './components/SettingsMenu';
 import { StartScreen } from './components/StartScreen';
-import { loadSettings, saveSettings } from './settings';
-import { ResourceField } from './world/resources';
+import { ANIMALS_BELOW_DEFAULT, loadSettings, saveSettings } from './settings';
+import { ResourceField, type OnScreen } from './world/resources';
+import { FlowerField } from './world/flowers';
 import { Sound } from './audio';
 import { Music } from './music';
 import { currentSeed, deleteSave, switchWorld, takeStartRequest } from './worlds';
@@ -96,6 +107,8 @@ const { x: startX, y: startY } = startPoint(world, terrain, seed);
 // Holzfäller arbeiten am liegenden Stamm - wie lang der ist, weiß die Darstellung.
 world.treeLength = (x, y) => resources.treeLengthAt(x, y);
 const resources = new ResourceField(terrain, mapGen);
+/** Blumen als 3D-Objekte, nah heran (world/flowers.ts). */
+const flowers = new FlowerField(terrain, mapGen);
 const sound = new Sound();
 /** Hintergrundmusik aus assets/music/ - der Ton-Schalter (M) gilt auch für sie. */
 const music = new Music();
@@ -124,6 +137,8 @@ const ui = new GameUi({ world, selection, placement, pointer, resources, sound, 
 // --- Einstellungen und Menü ------------------------------------------------
 
 const settings = loadSettings();
+// Blickwinkel wie beim letzten Mal - vor dem ersten Bild.
+setViewElevation(clampTilt((settings.tilt * Math.PI) / 180));
 /** Angehalten (F3 oder Menü): die Welt steht, Kamera und Auswahl gehen weiter. */
 let paused = false;
 const pausedEl = document.getElementById('paused')!;
@@ -263,9 +278,10 @@ function applyFacing(dir: string) {
   // Gedreht wird um die Stelle, die man in der Bildmitte sieht - mit ihrer
   // Geländehöhe. Um den Punkt auf Meereshöhe gedreht, wanderte ein Dorf auf
   // einem Hügel beim Drehen aus dem Bild.
-  const pivot = picker.point(camera.centerX, camera.centerY);
+  const pivot = focusPoint();
   rotateToFace(dir);
-  camera.centerOn(pivot.x, pivot.y, pivot.z);
+  keepFocus(pivot);
+  autoFlat = hiddenAtCenter(pivot.x, pivot.y);
   compass.update();
   // Die Blickrichtung bleibt beim Neuladen.
   settings.facing = dir;
@@ -321,7 +337,9 @@ new MouseInput(canvas, boxEl, {
   rightClick: (p) => actions.rightClick(p),
   pan: (dx, dy) => camera.panPixels(dx, dy),
   panEnd: () => ui.updateCursor(),
-  zoom: (step, p) => setZoom(camera.zoomIndex + step, p.x, p.y),
+  zoom: (steps, p) => zoomBy(steps, p.x, p.y),
+  tilt: (dy) => tiltBy(dy * TILT_PER_PIXEL),
+  turn: (direction) => faceDirection(directionAt(direction === 1 ? -1 : 1)),
   move: (p, buttons) => {
     const tileChanged = updateHoveredTile(p.x, p.y);
     // Felder markieren: jedes überstrichene Tile, auf dem gesät werden kann.
@@ -341,22 +359,152 @@ window.addEventListener('resize', resize);
 
 
 
+// --- Neigung ---------------------------------------------------------------
+
 /**
- * Zoomt so, dass das Welt-Tile unter dem Ankerpunkt dort stehen bleibt.
+ * Der Punkt, auf den man schaut (Welt, mit Geländehöhe bei vollem Relief):
+ * beim Neigen, Drehen und Flachlegen bleibt er genau in der Bildmitte.
+ * Bestimmt wird er einmal und gilt, bis die Kamera anders bewegt wird
+ * (Verschieben, Zoomen, Minimap). Je Bild neu gepickt, wanderte er mit jedem
+ * kleinen Rechenfehler weiter - und flacher geneigt verdeckt ein Berg im
+ * Vordergrund die Stelle, dann spränge er auf dessen Hang.
+ */
+let focus: { x: number; y: number; height: number; cameraX: number; cameraY: number } | null = null;
+
+/** Der festgehaltene Punkt, wenn die Kamera seitdem nicht anders bewegt wurde - sonst null. */
+function heldFocus() {
+  return focus && focus.cameraX === camera.x && focus.cameraY === camera.y ? focus : null;
+}
+
+function focusPoint() {
+  if (!heldFocus()) {
+    const p = picker.point(camera.centerX, camera.centerY);
+    focus = { x: p.x, y: p.y, height: ground.groundAt(p.x, p.y), cameraX: camera.x, cameraY: camera.y };
+  }
+  return focus!;
+}
+
+/** Legt den Punkt wieder genau in die Bildmitte (bei der jetzigen Reliefstärke) - und merkt sich, dass die Kamera nun so steht. */
+function keepFocus(f: NonNullable<typeof focus>) {
+  camera.centerOn(f.x, f.y, f.height * renderer.relief);
+  f.cameraX = camera.x;
+  f.cameraY = camera.y;
+}
+
+// --- Gelände im Weg --------------------------------------------------------
+
+/**
+ * Gelände automatisch flachlegen, wie mit gehaltener Leertaste: wenn nach dem
+ * Neigen oder Drehen ein Berg den angeschauten Punkt verdeckt - etwa das
+ * Haupthaus hinter einem Hang. Der Punkt bleibt dabei in der Bildmitte.
+ * Aufgerichtet wird wieder, sobald die Bildmitte auch bei vollem Relief frei
+ * ist (verschoben, zurückgedreht, steiler geneigt).
+ */
+let autoFlat = false;
+/** Ab so viel Abstand (Tiles) zwischen Punkt und erstem Treffer des Sichtstrahls gilt er als verdeckt. */
+const HIDDEN_TILES = 1;
+/** Kamera-Stand, für den autoFlat zuletzt geprüft wurde. */
+let autoFlatView = '';
+
+/**
+ * Wäre der Punkt (x, y) bei vollem Relief verdeckt, wenn er in der Bildmitte
+ * läge? Der Sichtstrahl durch die Mitte trifft dann vorher einen Hang.
+ */
+function hiddenAtCenter(x: number, y: number): boolean {
+  const view = camera.view();
+  const center = centerFor(view, x, y, ground.groundAt(x, y), camera.centerX, camera.centerY);
+  const hit = pickWorld({ ...view, centerX: center.x, centerY: center.y }, camera.centerX, camera.centerY,
+    (a, b) => ground.groundAt(a, b));
+  return Math.hypot(hit.x - x, hit.y - y) > HIDDEN_TILES;
+}
+
+/** Neigen mit Alt und rechter Maustaste: Radiant je Pixel (wie in der Galerie). */
+const TILT_PER_PIXEL = 0.006;
+/** Neigen mit Alt und Pfeil hoch/runter: ein Schritt (7,5°). */
+const TILT_STEP = Math.PI / 24;
+/** Wie schnell der Blickwinkel seinem Ziel folgt (je Sekunde) - wie beim Zoom. */
+const TILT_RATE = 18;
+/** So lange nach der letzten Eingabe (ms) gilt noch als "wird geneigt". */
+const TILT_SETTLE = 200;
+
+function clampTilt(rad: number): number {
+  return Math.min(TILT_MAX, Math.max(TILT_MIN, Number.isFinite(rad) ? rad : TILT_DEFAULT));
+}
+
+/** Wohin der Blickwinkel gleitet (Radiant) - geneigt wird weich in updateTilt(). */
+let tiltTarget = viewElevation();
+let lastTiltInput = 0;
+
+/** Zielwinkel verschieben (positiv: steiler, mehr von oben). */
+function tiltBy(rad: number) {
+  tiltTarget = clampTilt(tiltTarget + rad);
+  lastTiltInput = performance.now();
+}
+
+/**
+ * Ein Bild Neigung: der Blickwinkel folgt dem Ziel weich (Lerp). Gekippt
+ * wird um die Stelle in der Bildmitte mit ihrer Geländehöhe - wie beim
+ * Drehen, sonst wanderte ein Dorf auf einem Hügel aus dem Bild.
+ * true, wenn sich die Ansicht geändert hat.
+ */
+function updateTilt(dt: number, now: number): boolean {
+  // Solange noch gezogen wird, bleibt der Gelände-Cache gestreckt stehen.
+  const current = viewElevation();
+  renderer.tilting = current !== tiltTarget || now - lastTiltInput < TILT_SETTLE;
+  if (current === tiltTarget) return false;
+  let next = current + (tiltTarget - current) * (1 - Math.exp(-TILT_RATE * dt));
+  if (Math.abs(tiltTarget - next) < 0.0005) next = tiltTarget;
+  const pivot = focusPoint();
+  setViewElevation(next);
+  keepFocus(pivot);
+  autoFlat = hiddenAtCenter(pivot.x, pivot.y);
+  if (next === tiltTarget) {
+    // Der Blickwinkel bleibt beim Neuladen - wie die Blickrichtung.
+    settings.tilt = Math.round((next * 180) / Math.PI * 10) / 10;
+    saveSettings(settings);
+  }
+  return true;
+}
+
+/** Bildschirmstelle, um die gezoomt wird - bleibt bis zur nächsten Zoom-Eingabe. */
+let zoomAnchor: CanvasPoint | null = null;
+
+/**
+ * Zoomziel verschieben (game/Camera.ts); gezoomt wird weich in updateZoom().
  * Anker ist der Mauszeiger, solange er über der Karte ist, sonst die Bildmitte.
  */
-function setZoom(index: number, anchorX?: number, anchorY?: number) {
-  const ax = anchorX ?? pointer.pixel?.x ?? camera.centerX;
-  const ay = anchorY ?? pointer.pixel?.y ?? camera.centerY;
+function zoomBy(steps: number, anchorX?: number, anchorY?: number) {
+  zoomAnchor = {
+    x: anchorX ?? pointer.pixel?.x ?? camera.centerX,
+    y: anchorY ?? pointer.pixel?.y ?? camera.centerY,
+  };
+  camera.zoomBy(steps);
+}
+
+/**
+ * Ein Bild Zoom: so, dass das Welt-Tile unter dem Anker dort stehen bleibt.
+ * true, wenn sich die Ansicht geändert hat.
+ */
+function updateZoom(dt: number, now: number): boolean {
+  const ax = zoomAnchor?.x ?? camera.centerX;
+  const ay = zoomAnchor?.y ?? camera.centerY;
+  // Das Ziel kennt der Renderer schon, bevor der Zoom dort ist - er bereitet
+  // den Gelände-Cache der Zielstufe im Hintergrund vor.
+  renderer.targetTileSize = camera.targetTileSize;
   // Welt-Punkt unter dem Anker vor dem Zoom ...
   const anchor = picker.point(ax, ay);
-  if (!camera.setZoomIndex(index)) return;
+  if (!camera.stepZoom(dt, now)) return false;
   renderer.tileSize = camera.tileSize;
   // ... und danach wieder genau unter den Anker legen.
   camera.centerOn(anchor.x, anchor.y, anchor.z, ax, ay);
+  showZoom();
+  return true;
+}
 
-  refreshPointer();
-  devPanel.showZoom(camera.tileSize);
+/** Zoomstufe unter der Minimap ("Zoom 1" bis "Zoom 5") und in den Entwickler-Infos. */
+function showZoom() {
+  document.getElementById('zoom-level')!.textContent = `Zoom ${camera.zoomNumber}`;
+  devPanel.showZoom(camera);
 }
 
 /** Tastatur: gehaltene Tasten und die Belegung (game/keyboard.ts) - hier, was sie im Spiel tut. */
@@ -368,7 +516,10 @@ const keyboard = new Keyboard({
   closeMenu: () => menu.close(),
   togglePause,
   toggleSound,
-  zoom: (step) => setZoom(camera.zoomIndex + step),
+  zoom: (step) => zoomBy(step),
+  tiltStep: (step) => tiltBy(step * TILT_STEP),
+  // Wie die Pfeile unter der Minimap: rechts = was rechts liegt, kommt nach oben.
+  turn: (direction) => faceDirection(directionAt(direction === 1 ? -1 : 1)),
   cancel: () => ui.cancel(),
   demolish: () => actions.demolishSelected(),
   home: () => actions.cycleTownCenter(),
@@ -454,6 +605,20 @@ function updateHoverInfo() {
 }
 
 let lastTime = performance.now();
+
+/**
+ * Steht die Kamera (verschieben, zoomen, drehen) so lange still, zeichnet das
+ * Spiel nur noch IDLE_FPS Bilder je Sekunde - schont Akku und Lüfter. Die
+ * Welt läuft gleich schnell weiter, nur seltener gezeichnet.
+ */
+const IDLE_AFTER_MS = 1000;
+const IDLE_FPS = 30;
+let lastMove = performance.now();
+let lastFrame = 0;
+/** So oft je Sekunde wird die Minimap gezeichnet - sie bewegt sich langsam (Einstellung minimapFps). */
+const MINIMAP_FPS = 10;
+let lastMinimap = 0;
+let lastView = '';
 /** Die Simulation läuft in festen Schritten von 0.1 s (game/timing.ts). */
 const simulation = new FixedStep(0.1);
 /** Vorrat, Auswahl und Hover fünfmal je Sekunde - je Bild wäre es nur unruhig und teuer. */
@@ -469,6 +634,8 @@ const autosave = new Interval(60_000);
 
 /** Wird je Frame neu befüllt statt neu angelegt. */
 const overlay: EntityInstance[] = [];
+/** Feste Puffer der Vorkommen, an denen niemand arbeitet (world/resources.ts). */
+const staticBatches: StaticBatch[] = [];
 const minimapOverlay: EntityInstance[] = [];
 
 /**
@@ -477,16 +644,59 @@ const minimapOverlay: EntityInstance[] = [];
  * Feld und Gebäudetyp gleich bleiben; sonst liefe die Suche je Bild neu.
  */
 
+/**
+ * Feste Puffer für die Vorkommen (Regionen von 64x64 Tiles) nur weit draußen,
+ * unter so vielen CSS-Pixeln je Tile (Zoom 1, die Bäume als Bild): dort
+ * stehen Tausende Bäume im Bild, und die Puffer sparen das Einsammeln. Näher
+ * heran werden die Vorkommen einzeln eingesammelt, nur was im Bild steht
+ * (onScreenTest) - ganze Regionen zu zeichnen hieß gemessen 18-28 Mio.
+ * Eckpunkte je Bild, auch für nur 31 sichtbare Tiles; einzeln sind es bei
+ * Zoom 2 bis 5 noch 6,3 / 4,2 / 2,1 / 1,0 Mio., bei gleichen Bildzeiten.
+ */
+const STATIC_BATCHES_BELOW = 16;
+
+/**
+ * Steht ein Objekt im Bild (OnScreen in world/resources.ts)? In
+ * Bodenkoordinaten gegen den Bildausschnitt: im Bild rückt es um seine
+ * Geländehöhe und seine eigene Höhe nach oben. visibleWorldRect ist das
+ * achsenparallele Rechteck um die Bildraute - fast doppelt so groß, dazu der
+ * Rand für die höchsten Gipfel. Ein Tile Rand, und seitlich eine Objekthöhe
+ * (ein fallender Baum kippt zur Seite).
+ */
+function onScreenTest(): OnScreen {
+  const c = worldToGround(camera.x, camera.y);
+  const zs = viewZScreen();
+  const relief = renderer.relief;
+  const halfU = camera.width / 2 / camera.tileSize + 1;
+  const halfV = camera.height / 2 / camera.tileSize + 1;
+  return (x, y, ground, height) => {
+    const g = worldToGround(x, y);
+    if (Math.abs(g.u - c.u) > halfU + height) return false;
+    const foot = g.v - c.v - zs * ground * relief;
+    return foot > -halfV && foot - zs * height < halfV;
+  };
+}
+
 /** Alles, was über dem Gelände gezeichnet wird: Vorkommen, Welt, Auswahl und - im Baumodus - die Vorschau. */
 function collectOverlay(blend: number) {
   overlay.length = 0;
+  staticBatches.length = 0;
   const visible = visibleWorldRect(camera.view());
   if (camera.tileSize >= RESOURCE_OBJECTS_MIN_ZOOM) {
     resources.update(visible, camera.x, camera.y);
-    resources.instances(visible, world, overlay, selection.resource, blend);
+    if (camera.tileSize < STATIC_BATCHES_BELOW) {
+      resources.instances(visible, world, overlay, selection.resource, blend, { batcher: renderer, out: staticBatches });
+    } else {
+      resources.instances(visible, world, overlay, selection.resource, blend, undefined, onScreenTest());
+    }
+  }
+  if (renderer.flowerObjects) {
+    flowers.update(visible, camera.x, camera.y);
+    flowers.instances(visible, world, overlay);
   }
   const hovered = pointer.tile ? world.at(pointer.tile.x, pointer.tile.y)?.anchor : undefined;
-  worldInstances(world, visible, overlay, blend, selection, hovered);
+  worldInstances(world, visible, overlay, blend, selection, hovered,
+    (kind) => camera.tileSize < (settings.animalsBelow[kind] ?? ANIMALS_BELOW_DEFAULT));
   selectionOverlay(world, selection, blend, overlay);
   const tile = pointer.tile;
   if (placement.placingType !== null && tile) {
@@ -496,6 +706,19 @@ function collectOverlay(blend: number) {
 }
 
 function loop(now: number) {
+  // Stufenloser Zoom und Neigung zählen mit - beides bewegt die Ansicht.
+  const view = `${camera.x},${camera.y},${camera.zoom},${viewRotation()},${viewElevation()}`;
+  if (view !== lastView) {
+    lastView = view;
+    lastMove = now;
+  }
+  // Etwas Spiel, damit bei 60 Hz jedes zweite Bild kommt und nicht jedes dritte.
+  if (settings.idleFps && now - lastMove > IDLE_AFTER_MS && now - lastFrame < 1000 / IDLE_FPS - 4) {
+    requestAnimationFrame(loop);
+    return;
+  }
+  lastFrame = now;
+
   // Begrenzt, damit die Kamera nach einem Tab-Wechsel nicht quer über die Karte
   // springt (dt wäre dann die gesamte Zeit im Hintergrund).
   const dt = Math.min((now - lastTime) / 1000, 0.1);
@@ -503,7 +726,26 @@ function loop(now: number) {
 
 
   // WASD, Leertaste, hinter dem Hauptmenü langsam vorbeiziehen (game/cameraControl.ts).
-  if (steerCamera(camera, renderer, keyboard, dt, settings.scroll, start.isOpen())) refreshPointer();
+  const zoomed = updateZoom(dt, now);
+  const tilted = updateTilt(dt, now);
+  // Beim Flachlegen und Aufrichten bleibt der angeschaute Punkt in der Mitte,
+  // solange die Kamera nicht anders bewegt wurde.
+  const held = heldFocus();
+  const reliefBefore = renderer.relief;
+  const [cameraX, cameraY] = [camera.x, camera.y];
+  const steered = steerCamera(camera, renderer, keyboard, dt, settings.scroll, start.isOpen(), autoFlat);
+  if (held && renderer.relief !== reliefBefore && camera.x === cameraX && camera.y === cameraY) keepFocus(held);
+  if (steered || zoomed || tilted) refreshPointer();
+  // Flachgelegt, weil Gelände im Weg war: aufrichten, sobald die Bildmitte
+  // auch bei vollem Relief frei ist - geprüft, wenn sich die Ansicht ändert.
+  if (autoFlat) {
+    const seen = `${camera.x},${camera.y},${camera.zoom},${viewRotation()},${viewElevation()}`;
+    if (seen !== autoFlatView) {
+      autoFlatView = seen;
+      const p = heldFocus() ?? picker.point(camera.centerX, camera.centerY);
+      autoFlat = hiddenAtCenter(p.x, p.y);
+    }
+  }
 
   simulation.advance(paused || start.isOpen() ? 0 : dt * settings.speed, (step) => world.tick(step));
 
@@ -512,8 +754,11 @@ function loop(now: number) {
   if (animalCheck.due(now)) world.ensureAnimals(camera.x, camera.y);
   collectOverlay(simulation.blend);
   renderer.setPlayerColor(player.color.toRGB());
-  renderer.render(camera.x, camera.y, pointer.tile?.x, pointer.tile?.y, overlay);
-  if (pendingFacing) {
+  renderer.billboardBelow = settings.billboards;
+  const drawn = renderer.render(camera.x, camera.y, pointer.tile?.x, pointer.tile?.y, overlay, staticBatches);
+  // Das Bild für den Dreh-Übergang nur, wenn gerade gezeichnet wurde - sonst
+  // ist der WebGL-Puffer leer und der Übergang begänne schwarz.
+  if (pendingFacing && drawn) {
     turnAnimation.capture();
     const before = northAngle();
     applyFacing(pendingFacing);
@@ -523,11 +768,15 @@ function loop(now: number) {
     turnAnimation.play(turned === -180 ? 180 : -turned);
   }
 
-  const seen = minimapView();
-  minimapDots(world, minimap, seen, minimapOverlay);
-  minimap.render(seen, minimapOverlay);
+  if (!settings.minimapFps || now - lastMinimap >= 1000 / MINIMAP_FPS - 4) {
+    lastMinimap = now;
+    const seen = minimapView();
+    minimapDots(world, minimap, seen, minimapOverlay);
+    minimap.render(seen, minimapOverlay);
+    devPanel.minimapFrame();
+  }
 
-  devPanel.frame(now, camera);
+  devPanel.frame(now, camera, renderer.billboardsActive);
 
   if (uiRefresh.due(now)) {
     ui.refreshResources();
@@ -538,7 +787,7 @@ function loop(now: number) {
   requestAnimationFrame(loop);
 }
 
-devPanel.showZoom(camera.tileSize);
+showZoom();
 // Blickrichtung und Pause wie beim letzten Mal. Die Kamera bleibt auf dem
 // Feld aus der Adresse - gedreht wird nur die Ansicht.
 if (isDirection(settings.facing)) rotateToFace(settings.facing);

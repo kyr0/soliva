@@ -9,7 +9,9 @@
 // stehen sie genau auf dem Boden, den der Gelände-Shader zeichnet.
 
 import type { RGB } from '../functions/Color';
-import { PROJECT_GLSL, cameraDirection, setCameraUniforms, type GpuCamera } from './iso';
+import {
+  PROJECT_GLSL, cameraDirection, groundToWorld, setCameraUniforms, viewGroundV, viewRotation, viewZScreen, worldToGround, type GpuCamera,
+} from './iso';
 import { uploadTerrainParams } from './terrainRenderer';
 import humanoidClipsGlb from '../models/humanoid_clips.glb?inline';
 import humanoidClipsManifest from '../models/humanoid_clips.json';
@@ -25,7 +27,7 @@ import {
 } from './clips';
 import { TERRAIN_COMMON } from './terrainShader';
 import { FLATTEN_GLSL, MAX_FLAT_ZONES } from '../world/flatten';
-import { parseMtl, parseObj, type ObjTriangle } from './obj';
+import { parseMtl, parseMtlImages, parseObj, type ObjTriangle, type RGB01 } from './obj';
 import villagerMaleModel from '../models/villager_male.glb?model';
 import villagerFemaleModel from '../models/villager_female.glb?model';
 import propAxeModel from '../models/prop_axe.glb?model';
@@ -63,6 +65,7 @@ import gold1Model from '../models/gold_1.glb?model';
 import gold2Model from '../models/gold_2.glb?model';
 import gold3Model from '../models/gold_3.glb?model';
 import berryBush1Model from '../models/berry_bush_1.glb?model';
+import { FLOWER_KINDS, flowerModel } from './flowerModel';
 import berryBush2Model from '../models/berry_bush_2.glb?model';
 import berryBush3Model from '../models/berry_bush_3.glb?model';
 import berryBush4Model from '../models/berry_bush_4.glb?model';
@@ -215,7 +218,21 @@ export const SHAPE = {
   propScytheFemale: 105,
   propKnife: 106,
   propKnifeFemale: 107,
+  /**
+   * Blumen auf der Wiese (gl/flowerModel.ts, world/flowers.ts): Stiel, Blüte,
+   * Blätter - je Art eine Form, in FLOWER_KINDS-Reihenfolge ab 108.
+   */
+  flowerDaisy: 108,
+  flowerButtercup: 109,
+  flowerPoppy: 110,
+  flowerCornflower: 111,
+  flowerClover: 112,
 } as const;
+
+/** Die Blumen-Formen, in der Reihenfolge von FLOWER_KINDS. */
+export const FLOWERS: readonly number[] = [
+  SHAPE.flowerDaisy, SHAPE.flowerButtercup, SHAPE.flowerPoppy, SHAPE.flowerCornflower, SHAPE.flowerClover,
+];
 
 /**
  * Mittlere Drehzahl der Mühlenflügel (Radiant je Sekunde) und wie schnell die
@@ -292,6 +309,28 @@ const FOLIAGE_ROLE = 12;
 const LEAF_TEXTURE_UNIT = 3;
 /** Knochen-Matrizen der Clips aus Blender (uClipTex, siehe clips.ts). */
 const CLIP_TEXTURE_UNIT = 5;
+/** Bilder der Bäume für weit draußen (uBillboardTex, siehe ensureBillboards). */
+const BILLBOARD_TEXTURE_UNIT = 6;
+/** Bildtexturen aus den .glb-Modellen (uModelImages, siehe MODEL_IMAGES). */
+const IMAGE_TEXTURE_UNIT = 7;
+/** Kantenlänge jeder Bildtextur in uModelImages - alle Bilder werden darauf gebracht. */
+const IMAGE_SIZE = 512;
+/** Rolle der Flächen mit Bildtextur: statt der Farbe (u, v, Schicht in uModelImages). */
+const IMAGE_ROLE = 20;
+/**
+ * Bildtexturen aller Modelle (map_Kd, tools/models/glb.mjs) mit der
+ * Materialfarbe, die sie einfärbt - je Eintrag eine Schicht in uModelImages.
+ */
+const MODEL_IMAGES: { url: string; tint: RGB01 }[] = [];
+function imageLayer(url: string, tint: RGB01): number {
+  const i = MODEL_IMAGES.findIndex((m) => m.url === url && m.tint.every((c, k) => c === tint[k]));
+  return i >= 0 ? i : MODEL_IMAGES.push({ url, tint }) - 1;
+}
+/**
+ * So viele Drehungen je Baumart hat ein Billboard - das Bild liegt höchstens
+ * eine halbe Stufe (22,5°) neben der Drehung des Baums.
+ */
+export const BILLBOARD_HEADINGS = 8;
 
 /**
  * Wie viele Clips jede Bibliothek geladen hat - auch als
@@ -398,8 +437,22 @@ const LEAF_TEX_SIZE = 256;
 const LEAF_CARD_ROLE = 13;
 /** Rolle der Astkarten (Birke): ein ganzer Ast mit hängenden Zweigen und kleinen Blättern. */
 const BRANCH_CARD_ROLE = 14;
+/** Rolle der Blütenkarten (Blumen): der Shader malt die Blüte darauf (blossomCard). */
+const BLOSSOM_CARD_ROLE = 19;
+/** Rolle der Schattenkarten (Blumen): ein weicher dunkler Fleck unter der Blüte. */
+const FLOWER_SHADOW_ROLE = 21;
 /** Materialien der Karten, auf die der Shader malt - sie tragen (u, v, Zufall) statt einer Farbe. */
-const CARD_MATERIALS = new Set(['LeafCard', 'BranchCard']);
+const CARD_MATERIALS = new Set(['LeafCard', 'BranchCard', 'BlossomCard', 'FlowerShadow']);
+
+/** Die Arten als GLSL-Tabelle, aus FLOWER_KINDS - Index = Form - SHAPE.flowerDaisy. */
+const glslList = (type: string, values: string[]) => `${type}[${values.length}](${values.join(', ')})`;
+const glslVec3 = ([r, g, b]: readonly number[]) => `vec3(${r.toFixed(3)}, ${g.toFixed(3)}, ${b.toFixed(3)})`;
+const FLOWER_GLSL = `
+const float FLOWER_PETALS[${FLOWER_KINDS.length}] = ${glslList('float', FLOWER_KINDS.map((k) => k.petals.toFixed(1)))};
+const vec3 FLOWER_PETAL[${FLOWER_KINDS.length}] = ${glslList('vec3', FLOWER_KINDS.map((k) => glslVec3(k.petal)))};
+const vec3 FLOWER_HEART[${FLOWER_KINDS.length}] = ${glslList('vec3', FLOWER_KINDS.map((k) => glslVec3(k.heart)))};
+const float FLOWER_HEART_SIZE[${FLOWER_KINDS.length}] = ${glslList('float', FLOWER_KINDS.map((k) => k.heartSize.toFixed(3)))};
+`;
 /** Materialien, aus denen eine Krone besteht - daraus Mitte und Ausdehnung (Model.canopy). */
 const FOLIAGE_MATERIALS = new Set(['Paint', 'LeafDark', 'LeafLight', 'Needle', 'NeedleDark', 'LeafCard', 'BranchCard']);
 
@@ -413,7 +466,7 @@ const FOLIAGE_SHAPES: number[] = [
 const BEASTS: number[] = [SHAPE.deer, SHAPE.hare, SHAPE.cow, SHAPE.sheep, SHAPE.goat, SHAPE.boar];
 
 export const NATURAL: number[] = [
-  ...TREES,
+  ...TREES, ...FLOWERS,
   SHAPE.stoneRock, SHAPE.stoneRock2, SHAPE.stoneRock3, SHAPE.goldRock, SHAPE.goldRock2, SHAPE.goldRock3,
   SHAPE.berryBush, SHAPE.berryBush2, SHAPE.berryBush3, SHAPE.berryBush4,
 ];
@@ -586,6 +639,12 @@ uniform float uStump;        // Bäume: Höhe des Stumpfs in Modell-Einheiten
 uniform float uStumpRadius;  // Bäume: Halbmesser des Stumpfs in Modell-Einheiten
 // Bäume: diese Ecke liegt auf der Schnittfläche eines abgesägten Stamms.
 float gSawn = 0.0;
+// Bäume: Höhe des Schnitts beim Absägen (Modell-Einheiten) - der Stamm wird
+// darüber im Fragment-Shader abgeschnitten (vCut). 1e9: kein Schnitt.
+float gCut = 1e9;
+// Bäume: Richtung der Stammachse in der Welt (gekippt, wenn gefällt) - die
+// Normale der Schnittfläche (vCapNormal).
+vec3 gCapNormal = vec3(0.0, 0.0, 1.0);
 // Lage in Ruhelage (Modell-Einheiten des Körpers) - für die Texturen (vLocal).
 // Anhänge liegen in Metern im Rahmen der Hand und werden erst auf den Körper gebracht.
 vec3 gRest = vec3(0.0);
@@ -621,6 +680,11 @@ flat out vec3 vTeam;     // Instanzfarbe (Spielerfarbe) - für den Umriss verdec
 // und die Lage im Modell in Metern - die Textur haftet am Stamm, auch wenn
 // er umfällt.
 flat out int vTex;
+// Bäume beim Absägen: Schnitthöhe in Metern (Ruhelage wie vLocal), Normale der Schnittfläche.
+flat out float vCut;
+flat out vec3 vCapNormal;
+// Gesägt (1) - bei Bildtexturen je Eckpunkt, ihre Farbe ist ja (u, v, Schicht).
+out float vSawn;
 out vec3 vLocal;
 // Laub von Bäumen und Sträuchern (siehe BUSH_AND_TREE_FOLIAGE): Normale von
 // der Kronenmitte nach außen und wie tief innen bzw. unten es sitzt (0 Mitte,
@@ -633,6 +697,13 @@ uniform float uSkirt;        // 1: Gebäude reichen in den Boden (Spiel), 0: ohn
 uniform vec3  uCanopy;       // Bäume, Sträucher: Mitte der Krone (Modell-Einheiten)
 uniform vec3  uCanopyHalf;   // ... und ihre halbe Ausdehnung
 flat out float vRoof;   // Gebäude: 1 = Dachfläche. Figuren: Körperteil.
+// Baum als Bild (Billboard, siehe ensureBillboards): je Achtel-Drehung der
+// Ausschnitt im Bild (u0, v0, u1, v1) und die Lage des Rechtecks zum Fuß
+// (x0, y0 = oben links, Breite, Höhe) in Tiles je Größe 1, auf dem Bildschirm.
+uniform int  uBillboard;
+uniform vec4 uBillboardRect[${BILLBOARD_HEADINGS}];
+uniform vec4 uBillboardBox[${BILLBOARD_HEADINGS}];
+out vec2 vBillboardUV;
 
 // Körperteile der Figur - aCorner.w im Menschen-Mesh.
 const int P_TORSO = 0;
@@ -777,6 +848,27 @@ void main() {
   vec3 world;
   vBent = vec3(0.0, 0.0, 1.0);
   vFoliage = -1.0;
+  vBillboardUV = vec2(0.0);
+
+  if (uBillboard == 1) {
+    // Baum weit draußen: ein Rechteck zur Kamera mit dem vorab aus dem Modell
+    // gerenderten Bild. Die Ansicht ist parallel, das Bild ist also überall
+    // dasselbe - nur verschoben und nach der Größe skaliert. Die Tiefe wächst
+    // mit der Höhe über dem Fuß wie beim Modell.
+    int h = int(mod(floor(aMotion.x / ${((2 * Math.PI) / BILLBOARD_HEADINGS).toFixed(7)} + 0.5), ${BILLBOARD_HEADINGS}.0));
+    vec4 box = uBillboardBox[h];
+    vec2 off = (box.xy + aCorner.xy * box.zw) * aParams.z * uPixelsPerTile;
+    float base = aGround > ${GROUND_UNKNOWN / 10}.0 ? aGround * uReliefScale : groundZ(center);
+    vec4 foot = project(center, base);
+    vec4 clip = project(center, base + max(0.0, -off.y) / (uPixelsPerTile * uZScreen));
+    clip.xy = foot.xy + vec2(off.x, -off.y) * 2.0 / uResolution;
+    gl_Position = clip;
+    vec4 r = uBillboardRect[h];
+    vBillboardUV = mix(r.xy, r.zw, aCorner.xy);
+    vParams = aParams;
+    vColor = aColor;
+    return;
+  }
 
   if (shape == 10) {
     // Lebensbalken: ein Rechteck fester Pixelgroesse ueber dem Kopf der
@@ -899,15 +991,16 @@ void main() {
         // Laub, Äste, Zapfen: weg, sobald der Schnitt unter ihrem Ansatz liegt.
         float from = (aCorner.w - 15.0) / 0.45 * uModelTop;
         if (from > cut) p = vec3(0.0);
-      } else if (part == P_TRUNK && (aCorner.w - 19.0) / 0.45 * uModelTop > cut) {
-        // Stammstück ganz über dem Schnitt: weg. Flach gedrückt ergäbe ein
-        // schräger Stamm eine lange Platte auf dem Stumpf.
+      } else if (part == P_TRUNK && (aCorner.w - 19.0) / 0.45 * uModelTop > cut - 0.001 * uModelTop) {
+        // Stammstück ganz über dem Schnitt (oder genau auf ihm, wie das
+        // unterste auf dem Stumpf): weg. Flach gedrückt ergäbe ein schräger
+        // Stamm eine lange Platte auf dem Stumpf.
         p = vec3(0.0);
-      } else if (p.z > cut) {
-        // Das Stück, durch das gerade gesägt wird: auf die Schnitthöhe
-        // gedrückt - die Schnittfläche, hell wie frisch gesägtes Holz.
-        p.z = cut;
-        gSawn = 1.0;
+      } else if (part == P_TRUNK && aMotion.w < 0.999) {
+        // Das Stück, durch das gerade gesägt wird: der Fragment-Shader
+        // schneidet es auf Schnitthöhe ab und malt, wo man in den offenen
+        // Stamm hineinsieht, die Schnittfläche - rund, auch am schrägen Stamm.
+        gCut = cut;
       }
     }
 
@@ -1068,6 +1161,7 @@ void main() {
       float lift = up - hinge;
       offset = across + dir * (along * c + lift * s);
       up = hinge - along * s + lift * c;
+      gCapNormal = vec3(dir * s, c);
       // Gegen Ende rutscht der Stamm vom Stumpf: sein abgesägtes Ende liegt
       // dann neben dem Stumpf auf dem Boden, nicht obendrauf.
       float slide = smoothstep(0.75, 1.0, aMotion.y / ${FALL_LYING.toFixed(4)});
@@ -1154,6 +1248,9 @@ void main() {
   vColor = aColor;
   vTeam = aColor;
   vTex = 0;
+  vSawn = gSawn;
+  vCut = 1e9;
+  vCapNormal = gCapNormal;
   vLocal = vec3(0.0);
   if (shape >= 5 && shape != ${SHAPE_RING}) {
     // Modelle färben nach Material: Kittel bzw. Anstrich in der Instanzfarbe,
@@ -1163,15 +1260,17 @@ void main() {
     bool fieldShape = shape >= ${SHAPE.farmWheat} && shape < ${SHAPE.farmCorn + FIELD_FURROWS};
     vec3 paint = fieldShape ? uPlayerColor : aColor;
     vColor = role == 1 ? paint : role == 2 ? aAccent : aMaterial.rgb;
-    if (gSawn > 0.5) vColor = vec3(0.86, 0.71, 0.48);
+    if (gSawn > 0.5 && role != ${IMAGE_ROLE}) vColor = vec3(0.86, 0.71, 0.48);
     vColor = mix(vColor, vec3(0.34, 0.56, 0.2), gUnripe * 0.85);
     bool tree = ${TREES.map((n) => `shape == ${n}`).join(' || ')};
     bool villager = ${FIGURE_TEST};
     bool figureTex = role >= ${FIGURE_TEX.cloth} && role <= ${FIGURE_TEX.skin};
-    vTex = figureTex ? (villager ? role : 0)
+    vTex = role == ${IMAGE_ROLE} ? role
+      : figureTex ? (villager ? role : 0)
       : villager && (role == 1 || role == 2) ? ${FIGURE_TEX.cloth}
       : role >= 6 && role != ${FOLIAGE_ROLE} ? role : !tree ? 0 : gSawn > 0.5 ? 5 : (role == 3 || role == 4) ? role : 0;
     vLocal = gRest * uMeters;
+    if (gCut < 1e8) vCut = gCut * uMeters;
     // Bauvorschau: halbdurchsichtig ganz in der Vorschaufarbe - rot, wenn
     // der Platz nicht geht.
     if (!${FIGURE_TEST} && aParams.y < 0.99 && aMotion.w == 0.0) vColor = aColor;
@@ -1198,6 +1297,9 @@ in vec3 vWorld;
 in vec3 vColor;
 flat in vec3 vTeam;
 flat in int vTex;
+flat in float vCut;
+flat in vec3 vCapNormal;
+in float vSawn;
 in vec3 vLocal;
 in vec3 vBent;
 in float vFoliage;
@@ -1233,6 +1335,7 @@ float texDetail(float freq, float px) {
   return 1.0 - smoothstep(0.25, 0.6, freq * px);
 }
 
+uniform highp sampler2DArray uModelImages; // Bildtexturen der Modelle (IMAGE_ROLE)
 uniform sampler2D uLeafTex;  // Foto eines Birkenblatts (Blatt- und Astkarten)
 
 // Birkenrinde wie am Stamm (treeTexture, vTex 4), für gemalte Äste und Zweige:
@@ -1321,6 +1424,14 @@ vec3 figureTexture(vec3 base) {
   float flush = smoothstep(0.55, 0.9, texNoise(q * 4.0 + 2.2));
   vec3 c = base * (0.95 + 0.1 * mix(0.5, mottle, texDetail(18.0, px)));
   return mix(c, c * vec3(1.06, 0.93, 0.9), flush * 0.4);
+}
+
+// Bildtextur aus der .glb: base = (u, v, Schicht); v = 0 ist unten im Bild.
+// Durchsichtiges (Umriss der Blattkarten) wird verworfen.
+vec3 imageTexture(vec3 base) {
+  vec4 t = texture(uModelImages, vec3(base.x, 1.0 - base.y, floor(base.z + 0.5)));
+  if (t.a < 0.5) discard;
+  return t.rgb;
 }
 
 // Rinde als Textur: Stamm abgewickelt (Umfang, Höhe) in Metern.
@@ -1520,6 +1631,46 @@ uniform int uSilhouette;
 flat in vec3 vParams;
 flat in float vRoof;
 out vec4 fragColor;
+uniform highp int uBillboard;  // wie im Vertex-Shader, sonst lässt sich das Programm nicht linken
+uniform sampler2D uBillboardTex;
+in vec2 vBillboardUV;
+
+${FLOWER_GLSL}
+// Deckung der Blütenkarte am Rand der Blüte - geht ins Alpha (main).
+float gCardAlpha = 1.0;
+
+// Blütenkarte einer Blume: Blütenblätter mit Fugen und Wölbung, eine gewölbte
+// Mitte mit Glanzpunkt, Klee als Köpfchen aus Tupfen - wie die gemalten Blumen
+// im Gelände (flower() in terrainShader.ts). base = (u, v, Zufall); was
+// außerhalb der Blüte liegt, wird verworfen.
+vec3 blossomCard(vec3 base, int shape) {
+  int k = clamp(shape - ${SHAPE.flowerDaisy}, 0, ${FLOWER_KINDS.length - 1});
+  float petals = FLOWER_PETALS[k];
+  float heartSize = FLOWER_HEART_SIZE[k];
+  // Die Blüte füllt die Karte fast bis an den Rand.
+  vec2 q = (base.xy - 0.5) * 2.0 / 0.95;
+  float d = length(q);
+  // Ein Pixel in Einheiten der Blüte - für weiche, aber scharfe Ränder.
+  float px = max(fwidth(d), 1e-4);
+  float a = atan(q.y, q.x) + base.z * 6.2832;
+  float rim = petals > 0.0 ? 0.5 + 0.5 * pow(abs(cos(a * petals * 0.5)), 0.6) : 0.8;
+  gCardAlpha = smoothstep(rim + px, rim - px, d);
+  if (gCardAlpha < 0.02) discard;
+  // Licht von einer festen Seite der Karte - sie steht je Blume anders gedreht.
+  vec2 toSun = normalize(vec2(-0.45, 0.35));
+  float facing = dot(q, toSun) / max(d, 1e-3);
+  // Blütenblätter: zur Mitte hin tiefer (dunkler), außen heller, dazu die
+  // Wölbung zur Sonne und dunkle Fugen zwischen den Blättern.
+  vec3 col = FLOWER_PETAL[k] * (0.72 + 0.3 * d) * (0.9 + 0.22 * facing * min(d, 1.0));
+  if (petals > 0.0) col *= 0.82 + 0.18 * smoothstep(0.0, 0.35, abs(cos(a * petals * 0.5)));
+  else col *= 0.85 + 0.3 * step(0.5, fract((q.x + q.y) * 3.0) * fract((q.x - q.y) * 3.0) * 4.0);
+  // Die Mitte als kleine Kuppel mit Glanzpunkt.
+  float h = smoothstep(heartSize + px, heartSize - px, d);
+  vec3 hc = FLOWER_HEART[k] * (0.75 + 0.45 * clamp(1.0 - length(q / max(heartSize, 1e-3) - toSun * 0.4), 0.0, 1.0));
+  col = mix(col, hc, h);
+  float gloss = smoothstep(0.22, 0.0, length(q - toSun * max(heartSize, 0.35) * 0.9));
+  return mix(col, vec3(1.0), gloss * 0.35);
+}
 
 // Zur Kamera, in Weltkoordinaten - hängt von der Blickrichtung ab.
 uniform vec3 uToCamera;
@@ -1527,6 +1678,18 @@ uniform vec3 uToCamera;
 const vec3 SUN = vec3(-0.45, 0.35, 0.82);
 
 void main() {
+  if (uBillboard == 1) {
+    // Die Bilder sind in der Größe der Zoomstufe gerendert: Ränder und dünne
+    // Stämme sind halb deckend wie beim Modell und werden weich eingeblendet;
+    // nur fast Durchsichtiges fällt weg (es schriebe sonst Tiefe). Die Farbe
+    // ist vormultipliziert.
+    // Die Bilder zeigen den größten Baum; kleinere werden nur verkleinert.
+    // Die Verschiebung hält dabei die scharfe Stufe statt der nächstkleineren.
+    vec4 t = texture(uBillboardTex, vBillboardUV, -0.7);
+    if (t.a < 0.2) discard;
+    fragColor = vec4(t.rgb / t.a, t.a);
+    return;
+  }
   int shape = int(vParams.x + 0.5);
   float alpha = vParams.y;
 
@@ -1581,6 +1744,12 @@ void main() {
   // Flächennormale aus den Bildschirm-Ableitungen - die Klötze sind eckig,
   // eine Normale je Fläche ist genau richtig und spart ein Attribut.
   vec3 normal = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+  // Stamm beim Absägen: über dem Schnitt weg. Die Stammflächen zeigen nach
+  // außen (loadModel) - sieht man ihre Rückseite, blickt man durch den
+  // Schnitt in den Stamm und sieht dort die Schnittfläche.
+  if (vLocal.z > vCut) discard;
+  bool cutFace = vCut < 1e8 && gl_FrontFacing;
+  if (cutFace) normal = normalize(vCapNormal);
   if (dot(normal, uToCamera) < 0.0) normal = -normal;
 
   if (uSilhouette == 1) {
@@ -1592,7 +1761,16 @@ void main() {
   }
 
   vec3 base = vColor;
-  if (vTex >= ${FIGURE_TEX.cloth} && vTex <= ${FIGURE_TEX.skin}) base = figureTexture(base);
+  if (cutFace) base = vec3(0.86, 0.71, 0.48) * (0.9 + 0.1 * texNoise(vLocal.xy * 6.0));
+  else if (vTex == ${IMAGE_ROLE}) base = vSawn > 0.5 ? treeTexture(vec3(0.86, 0.71, 0.48)) : imageTexture(base);
+  else if (vTex >= ${FIGURE_TEX.cloth} && vTex <= ${FIGURE_TEX.skin}) base = figureTexture(base);
+  else if (vTex == ${BLOSSOM_CARD_ROLE}) base = blossomCard(base, shape);
+  else if (vTex == ${FLOWER_SHADOW_ROLE}) {
+    // Schatten der Blüte auf dem Gras: rund und weich, zur Mitte am dunkelsten.
+    gCardAlpha = 0.6 * (1.0 - smoothstep(0.3, 0.85, length(base.xy - 0.5) * 2.0));
+    if (gCardAlpha < 0.004) discard;
+    base = vec3(0.02, 0.05, 0.01);
+  }
   else if (vTex != 0) base = treeTexture(base);
   if (vRoof > 0.5 && shape != 0 && shape < 5) {
     // Spitzdächer bekommen einen dunklen Ziegelton, damit man Dach und Wand
@@ -1615,7 +1793,7 @@ void main() {
   }
 
   float light = 0.45 + 0.75 * max(dot(normal, normalize(SUN)), 0.0);
-  fragColor = vec4(base * light, alpha);
+  fragColor = vec4(base * light, alpha * gCardAlpha);
 }
 `;
 
@@ -1724,6 +1902,8 @@ const MATERIAL_ROLE: Record<string, number> = {
   NeedleDark: FOLIAGE_ROLE,
   LeafCard: LEAF_CARD_ROLE,
   BranchCard: BRANCH_CARD_ROLE,
+  BlossomCard: BLOSSOM_CARD_ROLE,
+  FlowerShadow: FLOWER_SHADOW_ROLE,
   // Felder (tools/models/farmsGen.mjs): Getreide, Blätter, Kolben.
   Wheat: 7,
   WheatDark: 7,
@@ -1800,6 +1980,14 @@ interface Model {
   hand: [number, number, number];
   /** Breite bzw. Höhe in Datei-Einheiten (Metern), auf die das Modell gebracht ist. */
   meters: number;
+  /** Die Datei in src/models (house.glb) - für die Galerie. */
+  file?: string;
+}
+
+/** Datei eines Modells aus seiner Zeile `mtllib house.mtl` (vite.config.ts). */
+function modelFile(obj: string): string | undefined {
+  const name = /^mtllib (.+)\.mtl$/m.exec(obj)?.[1];
+  return name && name !== 'model' ? `${name}.glb` : undefined;
 }
 
 /** Nummer einer Beere aus ihrem Objektnamen ("Berry.12.Shine" -> 12). */
@@ -1896,6 +2084,7 @@ function loadModel(obj: string | ObjTriangle[], mtl: string, unit: 'height' | 'w
   const entryPoints = markerPoints('Entry');
   const triangles = all.filter((t) => !isMarker(t.object));
   const colors = parseMtl(mtl);
+  const images = parseMtlImages(mtl);
   if (triangles.length === 0) throw new Error('Figuren-Modell ist leer');
 
   let minY = Infinity;
@@ -2001,6 +2190,36 @@ function loadModel(obj: string | ObjTriangle[], mtl: string, unit: 'height' | 'w
   }
   const onCut = (t: ObjTriangle) => t.points.every((q) => Math.abs(q[1] - stumpTop) < 1e-3);
 
+  // Bäume: die Stammstücke (außer dem Stumpf) zeigen mit ihrer Vorderseite
+  // nach außen - beim Absägen sieht man durch den Schnitt ihre Rückseite und
+  // malt dort die Schnittfläche (siehe vCut). Je Stück: zeigen die Flächen im
+  // Ganzen nach innen (Fluss durch die Hülle, von ihrer Mitte aus gemessen),
+  // werden sie umgedreht.
+  const isLog = (t: ObjTriangle) => sawable && t.object.startsWith('Trunk') && !t.object.startsWith('Trunk.Stump');
+  const inward = new Set<number>();
+  if (sawable) {
+    const sums = new Map<number, number[]>();
+    for (const t of triangles) {
+      if (!isLog(t)) continue;
+      const c = sums.get(t.index) ?? [0, 0, 0, 0];
+      for (const q of t.points) for (let i = 0; i < 3; i++) c[i] += q[i];
+      c[3] += 3;
+      sums.set(t.index, c);
+    }
+    const flux = new Map<number, number>();
+    for (const t of triangles) {
+      if (!isLog(t)) continue;
+      const c = sums.get(t.index)!;
+      const [a, b, d] = t.points;
+      const u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+      const w = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+      const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+      const m = [0, 1, 2].map((i) => (a[i] + b[i] + d[i]) / 3 - c[i] / c[3]);
+      flux.set(t.index, (flux.get(t.index) ?? 0) + m[0] * n[0] + m[1] * n[1] + m[2] * n[2]);
+    }
+    for (const [index, f] of flux) if (f < 0) inward.add(index);
+  }
+
   // Blattkarten: je Karte (Objekt) ihre Achsen - die längste Richtung ist v
   // (0 oben, wo sie am Ast hängt), die zweitlängste u. Gefunden über die
   // Hauptachsen ihrer Eckpunkte; die Karte liegt ja beliebig im Raum.
@@ -2029,9 +2248,15 @@ function loadModel(obj: string | ObjTriangle[], mtl: string, unit: 'height' | 'w
     // Blattkarte: statt einer Farbe ihre Lage auf der Karte (u, v) und ein
     // Zufall je Karte - der Shader malt Zweig und Blätter danach.
     const card = CARD_MATERIALS.has(t.material) ? cardFrame(t.index) : undefined;
-    for (const p of t.points) {
+    // Bildtextur: statt der Farbe (u, v, Schicht), eingefärbt wird beim Hochladen.
+    const image = images.get(t.material);
+    const layer = image && t.uvs ? imageLayer(image, color) : undefined;
+    const vertexRole = layer === undefined ? role : IMAGE_ROLE;
+    for (const k of inward.has(t.index) && isLog(t) ? [0, 2, 1] : [0, 1, 2]) {
+      const p = t.points[k];
       const [x, y, z] = local(p);
       let rgb = color;
+      if (layer !== undefined) rgb = [t.uvs![k][0], t.uvs![k][1], layer];
       if (card) {
         const d = [x - card.c[0], y - card.c[1], z - card.c[2]];
         const along = d[0] * card.a[0] + d[1] * card.a[1] + d[2] * card.a[2];
@@ -2056,13 +2281,13 @@ function loadModel(obj: string | ObjTriangle[], mtl: string, unit: 'height' | 'w
         // Stammstück (19 + Ansatzhöhe): über dem Schnitt verschwindet es ganz.
         : sawable ? 19 + (bottom.get(t.index) ?? 0) * 0.45
         : part;
-      v.push(x, y, z, partValue, rgb[0], rgb[1], rgb[2], role);
+      v.push(x, y, z, partValue, rgb[0], rgb[1], rgb[2], vertexRole);
       if (lod) {
         LOD_PARTS.forEach((min, i) => {
           // Stammstücke bleiben immer - sie sind kurz, der Stamm aber nicht.
           // Stammstücke bleiben immer - sie sind kurz, der Stamm aber nicht.
           // Blattkarten auch: ohne sie stünde die Birke weit draußen kahl da.
-          if ((extent.get(t.index) ?? 1) >= min || t.object.startsWith('Trunk') || card) lods[i].push(x, y, z, partValue, rgb[0], rgb[1], rgb[2], role);
+          if ((extent.get(t.index) ?? 1) >= min || t.object.startsWith('Trunk') || card) lods[i].push(x, y, z, partValue, rgb[0], rgb[1], rgb[2], vertexRole);
         });
       }
       // Hüfte und Schulter sitzen an der Oberkante von Beinen und Armen.
@@ -2118,6 +2343,7 @@ function loadModel(obj: string | ObjTriangle[], mtl: string, unit: 'height' | 'w
   const stand = markerAt(markerPoints('Work.Stand'));
   const aim = markerAt(markerPoints('Work.Aim'));
   return {
+    file: typeof obj === 'string' ? modelFile(obj) : undefined,
     entry: markerAt(entryPoints),
     work: stand && aim && { stand, aim },
     stockSlots,
@@ -2217,7 +2443,12 @@ const FIELD_DETAIL = [1, 0.3, 0.1];
 
 /** Ein Vorkommen: mit vereinfachten Fassungen, in seiner echten Breite. */
 function natural(shape: number, obj: string, mtl: string, meters: number) {
-  const model = loadModel(obj, mtl, 'width', true, TREES.includes(shape));
+  const all = parseObj(obj);
+  // Gras und Laub am Fuß der Bäume zählen für die Breite mit (und damit für
+  // die Größe), gezeichnet werden sie nicht - nur Stamm, Stumpf und Wurzeln.
+  const drawn = TREES.includes(shape) ? all.filter((t) => !/^(Grass|Litter)(\.|$)/.test(t.object)) : undefined;
+  const model = loadModel(all, mtl, 'width', true, TREES.includes(shape), drawn);
+  model.file = modelFile(obj);
   return [{ shape, model, scale: model.meters / meters }];
 }
 
@@ -2226,6 +2457,10 @@ function natural(shape: number, obj: string, mtl: string, meters: number) {
  * Instanzgröße - eine Figur der Größe 0.55 ist 0.55 * 1.7 Tiles hoch.
  */
 const PROP_AXE = loadModel(propAxeModel.obj, villagerMtl, 'meters');
+const FLOWER_MODEL = (() => {
+  const { obj, mtl } = flowerModel();
+  return loadModel(obj, mtl, 'width', true);
+})();
 const PROP_KNIFE = loadModel(propKnifeModel.obj, villagerMtl, 'meters');
 
 const MODELS: {
@@ -2279,6 +2514,9 @@ const MODELS: {
   ...natural(SHAPE.goldRock, gold1Model.obj, gold1Model.mtl, GOLD_METERS),
   ...natural(SHAPE.goldRock2, gold2Model.obj, gold2Model.mtl, GOLD_METERS),
   ...natural(SHAPE.goldRock3, gold3Model.obj, gold3Model.mtl, GOLD_METERS),
+  // Blumen: ein Modell für alle Arten, die Blüte malt der Shader je Form.
+  // In Breite 1 gebaut - die Instanzgröße ist ihre Breite in Tiles.
+  ...FLOWERS.map((shape) => ({ shape, model: FLOWER_MODEL, scale: 1 })),
   ...natural(SHAPE.berryBush, berryBush1Model.obj, berryBush1Model.mtl, BUSH_METERS),
   ...natural(SHAPE.berryBush2, berryBush2Model.obj, berryBush2Model.mtl, BUSH_METERS),
   ...natural(SHAPE.berryBush3, berryBush3Model.obj, berryBush3Model.mtl, BUSH_METERS),
@@ -2384,6 +2622,121 @@ interface Mesh {
   vertices: number;
 }
 
+/** Ein Modell auf der Grafikkarte und die Instanzen, die es in diesem Bild zeichnet. */
+interface ModelSlot {
+  shape: number; model: Model; scale: number; stride?: number; body?: number;
+  mesh: Mesh; lodMeshes: Mesh[]; list: EntityInstance[];
+}
+
+/**
+ * Instanzen, die sich nicht ändern - Bäume, Felsen und Sträucher einer
+ * Gegend, an denen niemand arbeitet: einmal gepackt und hochgeladen, danach
+ * Bild für Bild nur gezeichnet (world/resources.ts). Je Form ein Abschnitt.
+ */
+export interface StaticBatch {
+  buffer: WebGLBuffer;
+  ranges: Map<number, { first: number; count: number }>;
+}
+
+/**
+ * Bilder der Bäume für weit draußen, je Baumart eine eigene Textur - so passt
+ * auch die nächste Zoomstufe in die Grenzen der Grafikkarte. Gilt für eine
+ * Blickrichtung und eine Zoomstufe (`key`); eine Baumart wird erst gerendert,
+ * wenn sie im Bild vorkommt (BillboardBand.texture).
+ */
+interface BillboardSet {
+  key: string;
+  shapes: Map<number, BillboardBand>;
+}
+
+/** Bilder einer Baumart: je Drehung (BILLBOARD_HEADINGS) eines, reihenweise in ihrer Textur. */
+interface BillboardBand {
+  w: number;
+  h: number;
+  /** Erst gesetzt, wenn die Baumart gerendert ist. */
+  texture: WebGLTexture | null;
+  /**
+   * Lage in der Textur (x, y von unten, w, h), Fuß im Bild (fx, fy von oben
+   * links) und daraus Ausschnitt und Lage zum Fuß für den Shader
+   * (uBillboardRect/uBillboardBox).
+   */
+  cells: {
+    heading: number; x: number; y: number; w: number; h: number; fx: number; fy: number;
+    rect: [number, number, number, number]; box: [number, number, number, number];
+  }[];
+}
+
+/**
+ * Die Bilder zeigen den größten Baum der Karte (world/resources.ts: LOOK.wood
+ * 0,6, gestreut um ±20 %) - alle anderen werden daraus nur verkleinert.
+ */
+const BILLBOARD_TREE_SIZE = 0.6 * 1.2;
+/** Farbe der Bäume wie auf der Karte (LOOK.wood). */
+const BILLBOARD_TREE_COLOR: [number, number, number] = [42, 97, 52];
+/** Breite der Textur mit den Baumbildern; Rand um jedes Bild in Pixeln. */
+const BILLBOARD_ATLAS_WIDTH = 2048;
+const BILLBOARD_PAD = 3;
+
+/** Name jeder Form aus SHAPE, z. B. "treeOak" - für Dateinamen. */
+const SHAPE_NAME: Record<number, string> = Object.fromEntries(Object.entries(SHAPE).map(([name, shape]) => [shape, name]));
+
+/**
+ * Nur im Entwicklermodus: die gerenderten Bilder einer Baumart (aus dem
+ * gebundenen READ_FRAMEBUFFER) als PNG an den Dev-Server - er legt sie in
+ * tools/export/out/billboards/ ab (vite.config.ts), z. B. treeOak_64px_r0.png.
+ */
+/** Baumbilder als PNG ablegen (vite.config.ts) - nur mit ?saveBillboards in der Adresse. */
+const SAVE_BILLBOARDS = typeof location !== 'undefined' && new URLSearchParams(location.search).has('saveBillboards');
+
+function saveBillboard(gl: WebGL2RenderingContext, shape: number, band: BillboardBand, ppt: number) {
+  const raw = new Uint8Array(band.w * band.h * 4);
+  gl.readPixels(0, 0, band.w, band.h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
+  const canvas = document.createElement('canvas');
+  canvas.width = band.w;
+  canvas.height = band.h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const image = ctx.createImageData(band.w, band.h);
+  for (let y = 0; y < band.h; y++) {
+    // readPixels zählt von unten; die Farben sind vormultipliziert.
+    const from = (band.h - 1 - y) * band.w * 4;
+    for (let x = 0; x < band.w * 4; x += 4) {
+      const a = raw[from + x + 3];
+      for (let c = 0; c < 3; c++) image.data[y * band.w * 4 + x + c] = a ? Math.min(255, Math.round((raw[from + x + c] * 255) / a)) : 0;
+      image.data[y * band.w * 4 + x + 3] = a;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  const name = `${SHAPE_NAME[shape] ?? shape}_${ppt}px_r${viewRotation()}.png`;
+  canvas.toBlob((blob) => {
+    if (blob) void fetch(`/__billboards/${name}`, { method: 'POST', body: blob });
+  });
+}
+
+/** Eine Instanz in den Puffer ab Float `o` - STRIDE Floats. */
+function packInstance(d: Float32Array, o: number, e: EntityInstance) {
+  d[o] = e.x;
+  d[o + 1] = e.y;
+  d[o + 2] = e.color[0] / 255;
+  d[o + 3] = e.color[1] / 255;
+  d[o + 4] = e.color[2] / 255;
+  d[o + 5] = e.shape;
+  d[o + 6] = e.alpha;
+  d[o + 7] = e.size;
+  const m = e.motion;
+  // Ohne Angabe: Gebäude in ihrer Blickrichtung, Felder mit allen Furchen reif.
+  const field = !m && FIELDS.includes(e.shape);
+  d[o + 8] = m ? m[0] : field ? -1 : buildingHeading(e.shape);
+  d[o + 9] = m ? m[1] : field ? 3 : 0;
+  d[o + 10] = m ? m[2] : field ? 1 : 0;
+  d[o + 11] = m ? m[3] : field ? 511 : 0;
+  const a = e.accent ?? e.color;
+  d[o + 12] = a[0] / 255;
+  d[o + 13] = a[1] / 255;
+  d[o + 14] = a[2] / 255;
+  d[o + 15] = e.ground ?? GROUND_UNKNOWN;
+}
+
 export class EntityRenderer {
   private program: WebGLProgram;
   private building: Mesh;
@@ -2397,15 +2750,34 @@ export class EntityRenderer {
   skirts = true;
   /** Spielerfarbe (0..255) - Felder bekommen sie als Uniform (siehe uPlayerColor). */
   playerColor: [number, number, number] = [64, 160, 72];
-  private models: {
-    shape: number; model: Model; scale: number; stride?: number; body?: number;
-    mesh: Mesh; lodMeshes: Mesh[]; list: EntityInstance[];
-  }[];
+  private models: ModelSlot[];
+  /** Dieselben Modelle nach Form - je Instanz und Bild einmal nachgeschlagen. */
+  private modelByShape = new Map<number, ModelSlot>();
   private instanceBuffer: WebGLBuffer;
   /** Foto eines Birkenblatts für die Blatt- und Astkarten (uLeafTex). */
   private leafTexture: WebGLTexture;
   /** Knochen-Matrizen der Clips, für jede Figur gebacken (uClipTex, siehe clips.ts). */
   private clipTexture: WebGLTexture;
+  /** true, sobald das Blattfoto geladen ist - vorher sind Birken nur grün. */
+  leafReady = false;
+  /** Bildtexturen der Modelle, eine Schicht je MODEL_IMAGES-Eintrag (uModelImages). */
+  private imageTexture: WebGLTexture;
+  /** So viele davon sind geladen - vorher ist ihre Schicht durchsichtig. */
+  private imagesLoaded = 0;
+  /**
+   * Unter so vielen CSS-Pixeln je Tile zeichnen die Bäume der festen Puffer
+   * als Bild statt als Modell (0: nie). Gefällte, angefangene und
+   * ausgewählte Bäume bleiben Modelle.
+   */
+  billboardBelow = 0;
+  /** Ob im letzten Bild Bäume als Bild gezeichnet wurden (Entwickler-Infos). */
+  billboardsActive = false;
+  /** Die Baumbilder der jetzigen Blickrichtung und Zoomstufe - erst gerendert, wenn sie gebraucht werden. */
+  private billboardSet: BillboardSet | null = null;
+  /** Zeichenfläche, wenn nicht ins Canvas gezeichnet wird (die Baumbilder). */
+  private targetSize: { width: number; height: number } | null = null;
+  /** Ein Rechteck aus zwei Dreiecken - die Fläche eines Billboards. */
+  private quad: Mesh;
   /** Clip-Uniforms je Modell (Form): erste Zeile jedes Clips in clipTexture, Länge, Pose ... */
   private clipUniforms = new Map<number, ClipUniforms>();
   private uniforms = new Map<string, WebGLUniformLocation | null>();
@@ -2432,16 +2804,20 @@ export class EntityRenderer {
     this.instanceBuffer = gl.createBuffer()!;
     this.building = this.createMesh(buildingMesh());
     this.flat = this.createMesh(flatMesh());
+    this.quad = this.createMesh(new Float32Array([0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0]));
     this.models = MODELS.map((m) => ({
       ...m,
       mesh: this.createMesh(m.model.vertices, 8),
       lodMeshes: (m.model.lods ?? []).map((l) => this.createMesh(l, 8)),
       list: [],
     }));
+    for (const m of this.models) this.modelByShape.set(m.shape, m);
 
     gl.useProgram(this.program);
     uploadTerrainParams(gl, (name) => this.location(name));
     gl.uniform1i(this.location('uLeafTex'), LEAF_TEXTURE_UNIT);
+    gl.uniform1i(this.location('uBillboardTex'), BILLBOARD_TEXTURE_UNIT);
+    gl.uniform1i(this.location('uModelImages'), IMAGE_TEXTURE_UNIT);
 
     // Blatt-Textur: bis das Bild geladen ist, ein einzelnes grünes Pixel.
     this.leafTexture = gl.createTexture()!;
@@ -2451,6 +2827,7 @@ export class EntityRenderer {
     gl.activeTexture(gl.TEXTURE0);
     const image = new Image();
     image.onload = () => {
+      this.leafReady = true;
       gl.activeTexture(gl.TEXTURE0 + LEAF_TEXTURE_UNIT);
       gl.bindTexture(gl.TEXTURE_2D, this.leafTexture);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
@@ -2463,7 +2840,52 @@ export class EntityRenderer {
     };
     image.src = birchLeafUrl;
 
+    this.imageTexture = this.loadModelImages();
+
     this.clipTexture = this.bakeClips();
+  }
+
+  /**
+   * Die Bildtexturen der Modelle (MODEL_IMAGES) als Schichten einer
+   * Array-Textur, je IMAGE_SIZE² Pixel, kachelnd. Die Bilder laden danach;
+   * bis dahin ist ihre Schicht leer (durchsichtig).
+   */
+  private loadModelImages(): WebGLTexture {
+    const gl = this.gl;
+    const texture = gl.createTexture()!;
+    const levels = Math.log2(IMAGE_SIZE) + 1;
+    gl.activeTexture(gl.TEXTURE0 + IMAGE_TEXTURE_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, levels, gl.RGBA8, IMAGE_SIZE, IMAGE_SIZE, Math.max(1, MODEL_IMAGES.length));
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    gl.activeTexture(gl.TEXTURE0);
+    MODEL_IMAGES.forEach(({ url, tint }, layer) => {
+      const image = new Image();
+      image.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = IMAGE_SIZE;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+        ctx.drawImage(image, 0, 0, IMAGE_SIZE, IMAGE_SIZE);
+        const pixels = ctx.getImageData(0, 0, IMAGE_SIZE, IMAGE_SIZE);
+        const d = pixels.data;
+        for (let i = 0; i < d.length; i += 4) {
+          d[i] *= tint[0];
+          d[i + 1] *= tint[1];
+          d[i + 2] *= tint[2];
+        }
+        gl.activeTexture(gl.TEXTURE0 + IMAGE_TEXTURE_UNIT);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
+        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, layer, IMAGE_SIZE, IMAGE_SIZE, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+        gl.activeTexture(gl.TEXTURE0);
+        this.imagesLoaded++;
+      };
+      image.src = url;
+    });
+    return texture;
   }
 
   /**
@@ -2568,6 +2990,11 @@ export class EntityRenderer {
     return { vao, vertices: vertices.length / components };
   }
 
+  /** Datei des Modells einer Form (tree_oak.glb) - oder keine (Felder, Klötze). */
+  modelFile(shape: number): string | undefined {
+    return this.modelByShape.get(shape)?.model.file;
+  }
+
   private location(name: string): WebGLUniformLocation | null {
     if (!this.uniforms.has(name)) {
       this.uniforms.set(name, this.gl.getUniformLocation(this.program, name));
@@ -2575,14 +3002,195 @@ export class EntityRenderer {
     return this.uniforms.get(name)!;
   }
 
-  /** Instanzen ab `first` in den Instanz-Puffer. Die Attribut-Zeiger zeigen auf diesen Abschnitt. */
-  private draw(mesh: Mesh, first: number, count: number) {
+  /**
+   * Packt Instanzen von Modellen (Bäume, Felsen, Sträucher ...) nach Form
+   * sortiert in einen eigenen Puffer auf der Grafikkarte. Andere Formen
+   * (Gebäude-Klötze, Flächen) gehören nicht hinein und werden übergangen.
+   */
+  createBatch(instances: readonly EntityInstance[]): StaticBatch {
+    const byShape = new Map<number, EntityInstance[]>();
+    for (const e of instances) {
+      if (!this.modelByShape.has(e.shape)) continue;
+      let list = byShape.get(e.shape);
+      if (!list) byShape.set(e.shape, (list = []));
+      list.push(e);
+    }
+    const d = new Float32Array(instances.length * STRIDE);
+    const ranges = new Map<number, { first: number; count: number }>();
+    let i = 0;
+    for (const [shape, list] of byShape) {
+      ranges.set(shape, { first: i, count: list.length });
+      for (const e of list) packInstance(d, i++ * STRIDE, e);
+    }
+    const gl = this.gl;
+    const buffer = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, d.subarray(0, i * STRIDE), gl.STATIC_DRAW);
+    return { buffer, ranges };
+  }
+
+  deleteBatch(batch: StaticBatch) {
+    this.gl.deleteBuffer(batch.buffer);
+  }
+
+  /**
+   * Plant die Baumbilder für die jetzige Blickrichtung und Zoomstufe: wie groß
+   * jedes wird (aus den Eckpunkten des Modells, projiziert wie im Shader) und
+   * wo es in der Textur seiner Baumart liegt. Gerendert wird hier noch nichts.
+   * Eine Baumart, deren Textur zu groß für die Grafikkarte wäre, fehlt - sie
+   * bleibt Modell.
+   */
+  private planBillboards(key: string, ppt: number): BillboardSet {
+    const max = this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) as number;
+    const zScreen = viewZScreen();
+    const unit = ppt * BILLBOARD_TREE_SIZE;
+    const set: BillboardSet = { key, shapes: new Map() };
+    for (const shape of TREES) {
+      const m = this.modelByShape.get(shape);
+      if (!m) continue;
+      const v = m.model.vertices;
+      const s = m.scale * BILLBOARD_TREE_SIZE;
+      const band: BillboardBand = { w: 0, h: 0, texture: null, cells: [] };
+      let x = 0, y = 0, row = 0;
+      for (let k = 0; k < BILLBOARD_HEADINGS; k++) {
+        const heading = (k * 2 * Math.PI) / BILLBOARD_HEADINGS;
+        const c = Math.cos(heading), sn = Math.sin(heading);
+        let u0 = Infinity, u1 = -Infinity, g0 = Infinity, g1 = -Infinity;
+        for (let i = 0; i < v.length; i += 8) {
+          const g = worldToGround((c * v[i] - sn * v[i + 1]) * s, (sn * v[i] + c * v[i + 1]) * s);
+          const gy = g.v - zScreen * v[i + 2] * s;
+          u0 = Math.min(u0, g.u); u1 = Math.max(u1, g.u);
+          g0 = Math.min(g0, gy); g1 = Math.max(g1, gy);
+        }
+        // Ein Rand für Laub, das sich im Wind bewegt.
+        const pad = BILLBOARD_PAD + Math.ceil((u1 - u0) * ppt * 0.05);
+        const w = Math.ceil((u1 - u0) * ppt) + 2 * pad;
+        const h = Math.ceil((g1 - g0) * ppt) + 2 * pad;
+        if (x + w > BILLBOARD_ATLAS_WIDTH && x > 0) {
+          x = 0;
+          y += row;
+          row = 0;
+        }
+        band.cells.push({ heading, x, y, w, h, fx: -u0 * ppt + pad, fy: -g0 * ppt + pad, rect: [0, 0, 0, 0], box: [0, 0, 0, 0] });
+        x += w;
+        band.w = Math.max(band.w, x);
+        row = Math.max(row, h);
+      }
+      band.h = y + row;
+      if (band.w > max || band.h > max) continue;
+      for (const cell of band.cells) {
+        // Oben im Bild ist in der Textur das größere y.
+        cell.rect = [cell.x / band.w, (cell.y + cell.h) / band.h, (cell.x + cell.w) / band.w, cell.y / band.h];
+        cell.box = [-cell.fx / unit, -cell.fy / unit, cell.w / unit, cell.h / unit];
+      }
+      set.shapes.set(shape, band);
+    }
+    return set;
+  }
+
+  /**
+   * Rendert die Bilder einer Baumart (alle Drehungen) in ihre Textur - in einen
+   * Framebuffer mit Kantenglättung, dann übertragen. So zeichnet dasselbe
+   * Programm den Baum wie als Modell; nichts geht über den Arbeitsspeicher.
+   */
+  private renderBillboardBand(shape: number, band: BillboardBand, ppt: number, pixelRatio: number) {
+    const gl = this.gl;
+    const samples = Math.min(4, gl.getParameter(gl.MAX_SAMPLES) as number);
+    const color = gl.createRenderbuffer()!;
+    gl.bindRenderbuffer(gl.RENDERBUFFER, color);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, band.w, band.h);
+    const depth = gl.createRenderbuffer()!;
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, band.w, band.h);
+    const msaa = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msaa);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, color);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+    gl.viewport(0, 0, band.w, band.h);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    for (const cell of band.cells) {
+      gl.viewport(cell.x, cell.y, cell.w, cell.h);
+      this.targetSize = { width: cell.w, height: cell.h };
+      // Kamera so, dass der Fuß (Welt 0, 0) im Bild bei (fx, fy) von oben links liegt.
+      const center = groundToWorld((cell.w / 2 - cell.fx) / ppt, (cell.h / 2 - cell.fy) / ppt);
+      const tree: EntityInstance = {
+        x: -0.5, y: -0.5, size: BILLBOARD_TREE_SIZE, color: BILLBOARD_TREE_COLOR, shape, alpha: 1,
+        motion: [cell.heading, 0, 0, 1],
+      };
+      this.render([tree], { centerX: center.x, centerY: center.y, pixelsPerTile: ppt, reliefScale: 0 }, 0, pixelRatio);
+    }
+    this.targetSize = null;
+
+    const texture = gl.createTexture()!;
+    gl.activeTexture(gl.TEXTURE0 + BILLBOARD_TEXTURE_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, band.w, band.h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const resolved = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, resolved);
+    gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaa);
+    gl.blitFramebuffer(0, 0, band.w, band.h, 0, 0, band.w, band.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    // Nur auf Wunsch (Adresse mit ?saveBillboards): das Auslesen hält die
+    // Grafikkarte an und kostete beim Herauszoomen gemessen 180 ms am Stück.
+    if (import.meta.env.DEV && SAVE_BILLBOARDS) {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, resolved);
+      saveBillboard(gl, shape, band, ppt);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.deleteFramebuffer(resolved);
+    gl.deleteFramebuffer(msaa);
+    gl.deleteRenderbuffer(color);
+    gl.deleteRenderbuffer(depth);
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    band.texture = texture;
+  }
+
+  /**
+   * Die Baumbilder für die jetzige Blickrichtung, Zoomstufe und Neigung - je
+   * Baumart erst, wenn sie im Bild vorkommt (`shapes`), direkt in eine Textur
+   * dieses Renderers. Nach dem Drehen, Zoomen oder Neigen wird neu gerendert.
+   * Zoom und Neigung kommen als die des Gelände-Caches (GpuCamera.cache*):
+   * die bleiben stehen, solange weich gezoomt oder geneigt wird - mit dem
+   * jetzigen Zoom würde je Bild neu gerendert, das kostete jedes Mal
+   * Dutzende Millisekunden. false, wenn es keine Bilder gibt.
+   */
+  private ensureBillboards(pixelsPerTile: number, groundV: number, pixelRatio: number, shapes: Iterable<number>): boolean {
+    const key = `${viewRotation()}|${pixelsPerTile}|${groundV.toFixed(4)}|${pixelRatio}|${this.leafReady}|${this.imagesLoaded}`;
+    if (this.billboardSet?.key !== key) {
+      for (const band of this.billboardSet?.shapes.values() ?? []) if (band.texture) this.gl.deleteTexture(band.texture);
+      this.billboardSet = this.planBillboards(key, pixelsPerTile);
+    }
+    const set = this.billboardSet;
+    // Höchstens eine Baumart je Bild - alle auf einmal hielten das Bild spürbar
+    // an. Bis ihr Bild da ist, steht eine Art als Modell da (siehe drawModel).
+    for (const shape of shapes) {
+      const band = set.shapes.get(shape);
+      if (band && !band.texture) {
+        this.renderBillboardBand(shape, band, pixelsPerTile, pixelRatio);
+        break;
+      }
+    }
+    return set.shapes.size > 0;
+  }
+
+  /**
+   * Instanzen ab `first` in `buffer` (sonst dem Instanz-Puffer dieses Bildes).
+   * Die Attribut-Zeiger zeigen auf diesen Abschnitt.
+   */
+  private draw(mesh: Mesh, first: number, count: number, buffer = this.instanceBuffer) {
     if (count === 0) return;
     const gl = this.gl;
     const bytes = STRIDE * 4;
     const offset = first * bytes;
     gl.bindVertexArray(mesh.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.vertexAttribPointer(1, 2, gl.FLOAT, false, bytes, offset);
     gl.vertexAttribPointer(2, 3, gl.FLOAT, false, bytes, offset + 8);
     gl.vertexAttribPointer(3, 3, gl.FLOAT, false, bytes, offset + 20);
@@ -2598,6 +3206,7 @@ export class EntityRenderer {
    * @param minSizeTiles Mindestgröße, damit Gebäude beim Herauszoomen nicht verschwinden
    * @param pixelRatio Geräte-Pixel je CSS-Pixel - Lebensbalken haben feste CSS-Größe
    * @param healthBars Lebensbalken über allem mit `health` zeichnen
+   * @param batches feste Puffer (createBatch), dazu gezeichnet
    */
   render(
       instances: EntityInstance[],
@@ -2605,9 +3214,19 @@ export class EntityRenderer {
       minSizeTiles: number,
       pixelRatio = 1,
       healthBars = false,
+      batches: readonly StaticBatch[] = [],
   ) {
-    if (instances.length === 0) return;
+    this.billboardsActive = false;
+    if (instances.length === 0 && batches.length === 0) return;
     const gl = this.gl;
+    // Baumbilder zuerst: ihr Rendern benutzt dieselben Listen und Puffer wie dieses Bild.
+    const cssPixelsPerTile = camera.pixelsPerTile / pixelRatio;
+    // Nur die Baumarten, die gerade im Bild stehen.
+    const shown = new Set<number>();
+    for (const batch of batches) for (const shape of batch.ranges.keys()) if (TREES.includes(shape)) shown.add(shape);
+    const billboards = shown.size > 0 && cssPixelsPerTile < this.billboardBelow
+      && this.ensureBillboards(camera.cachePixelsPerTile ?? camera.pixelsPerTile, camera.cacheGroundV ?? viewGroundV(), pixelRatio, shown);
+    this.billboardsActive = billboards;
 
     // Overlays zuerst, dann die Gebäude von hinten nach vorn - halbtransparente
     // Vorschau-Klötze mischen sich sonst mit dem falschen Hintergrund.
@@ -2621,7 +3240,7 @@ export class EntityRenderer {
     for (const e of instances) {
       if (e.shape === SHAPE.flat || e.shape === SHAPE.ring) flats.push(e);
       else if (e.shape === SHAPE.dust) puffs.push(e);
-      else (this.models.find((m) => m.shape === e.shape)?.list ?? solids).push(e);
+      else (this.modelByShape.get(e.shape)?.list ?? solids).push(e);
     }
     const backToFront = (a: EntityInstance, b: EntityInstance) => a.x + a.y - (b.x + b.y);
     solids.sort(backToFront);
@@ -2639,29 +3258,7 @@ export class EntityRenderer {
     const d = this.data;
     let i = 0;
     for (const list of [flats, solids, ...this.models.map((m) => m.list), puffs]) {
-      for (const e of list) {
-        const o = i++ * STRIDE;
-        d[o] = e.x;
-        d[o + 1] = e.y;
-        d[o + 2] = e.color[0] / 255;
-        d[o + 3] = e.color[1] / 255;
-        d[o + 4] = e.color[2] / 255;
-        d[o + 5] = e.shape;
-        d[o + 6] = e.alpha;
-        d[o + 7] = e.size;
-        const m = e.motion;
-        // Ohne Angabe: Gebäude in ihrer Blickrichtung, Felder mit allen Furchen reif.
-        const field = !m && FIELDS.includes(e.shape);
-        d[o + 8] = m ? m[0] : field ? -1 : buildingHeading(e.shape);
-        d[o + 9] = m ? m[1] : field ? 3 : 0;
-        d[o + 10] = m ? m[2] : field ? 1 : 0;
-        d[o + 11] = m ? m[3] : field ? 511 : 0;
-        const a = e.accent ?? e.color;
-        d[o + 12] = a[0] / 255;
-        d[o + 13] = a[1] / 255;
-        d[o + 14] = a[2] / 255;
-        d[o + 15] = e.ground ?? GROUND_UNKNOWN;
-      }
+      for (const e of list) packInstance(d, i++ * STRIDE, e);
     }
     for (const e of bars) {
       const o = i++ * STRIDE;
@@ -2672,7 +3269,7 @@ export class EntityRenderer {
     gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, d.subarray(0, total * STRIDE), gl.DYNAMIC_DRAW);
 
-    setCameraUniforms(gl, (name) => this.location(name), camera);
+    setCameraUniforms(gl, (name) => this.location(name), camera, this.targetSize ?? gl.canvas);
     gl.uniform3fv(this.location('uToCamera'), cameraDirection());
     gl.uniform1f(this.location('uMinSizeTiles'), minSizeTiles);
     gl.uniform1i(this.location('uSilhouette'), 0);
@@ -2699,9 +3296,10 @@ export class EntityRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.leafTexture);
     gl.activeTexture(gl.TEXTURE0 + CLIP_TEXTURE_UNIT);
     gl.bindTexture(gl.TEXTURE_2D, this.clipTexture);
+    gl.activeTexture(gl.TEXTURE0 + IMAGE_TEXTURE_UNIT);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.imageTexture);
     gl.activeTexture(gl.TEXTURE0);
     // Herausgezoomt die vereinfachten Fassungen der Vorkommen.
-    const cssPixelsPerTile = camera.pixelsPerTile / pixelRatio;
     const lod = LOD_ZOOM.filter((z) => cssPixelsPerTile < z).length;
     const fieldLod = FIELD_LOD_ZOOM.filter((z) => cssPixelsPerTile < z).length;
     let first = flats.length + solids.length;
@@ -2734,14 +3332,33 @@ export class EntityRenderer {
       gl.uniform1fv(this.location('uPoseRate'), clips.poseRate);
       gl.uniform1fv(this.location('uPoseShift'), clips.poseShift);
       const level = FIELDS.includes(m.shape) ? fieldLod : lod;
-      this.draw(level > 0 && m.lodMeshes.length > 0 ? m.lodMeshes[level - 1] : m.mesh, offset, m.list.length);
+      // Hat ein Modell weniger Fassungen (Felder: zwei), gilt seine gröbste.
+      const mesh = level > 0 && m.lodMeshes.length > 0 ? m.lodMeshes[Math.min(level, m.lodMeshes.length) - 1] : m.mesh;
+      this.draw(mesh, offset, m.list.length);
+      const band = billboards ? this.billboardSet!.shapes.get(m.shape) : undefined;
+      const cells = band?.texture ? band.cells : undefined;
+      if (cells) {
+        gl.activeTexture(gl.TEXTURE0 + BILLBOARD_TEXTURE_UNIT);
+        gl.bindTexture(gl.TEXTURE_2D, band!.texture);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.uniform4fv(this.location('uBillboardRect[0]'), cells.flatMap((c) => c.rect));
+        gl.uniform4fv(this.location('uBillboardBox[0]'), cells.flatMap((c) => c.box));
+        gl.uniform1i(this.location('uBillboard'), 1);
+      }
+      for (const batch of batches) {
+        const range = batch.ranges.get(m.shape);
+        if (range) this.draw(cells ? this.quad : mesh, range.first, range.count, batch.buffer);
+      }
+      if (cells) gl.uniform1i(this.location('uBillboard'), 0);
     };
+    const batched = new Set<number>();
+    for (const batch of batches) for (const shape of batch.ranges.keys()) batched.add(shape);
     // Erst alles außer den Figuren, dann die Figuren - dazwischen ihr Umriss,
     // wo etwas vor ihnen steht (wie in AoE2). Die Figuren sind dann noch nicht
     // im Tiefenpuffer und verdecken sich nicht selbst.
-    const figures: [(typeof this.models)[number], number][] = [];
+    const figures: [ModelSlot, number][] = [];
     for (const m of this.models) {
-      if (m.list.length > 0) {
+      if (m.list.length > 0 || batched.has(m.shape)) {
         if (FIGURES.includes(m.shape)) figures.push([m, first]);
         else drawModel(m, first);
       }

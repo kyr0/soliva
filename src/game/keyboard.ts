@@ -9,6 +9,7 @@
 
 import type { BuildingType } from '../world/catalog';
 import { controlForKey } from './controls';
+import { altHeld } from './MouseInput';
 
 /** Was die Tasten im Spiel auslösen. */
 export interface KeyCommands {
@@ -21,6 +22,10 @@ export interface KeyCommands {
   toggleSound(): void;
   /** Eine Zoomstufe hinein (+1) oder hinaus (-1). */
   zoom(step: 1 | -1): void;
+  /** Alt + Pfeil hoch/runter: einen Schritt steiler (+1) oder flacher (-1) neigen. */
+  tiltStep(step: 1 | -1): void;
+  /** Alt + Pfeil rechts/links: eine Vierteldrehung (1 = nach rechts, -1 = nach links). */
+  turn(direction: 1 | -1): void;
   /** Esc im Spiel: Untermenü zu, Baumodus aus, sonst Auswahl aufheben. */
   cancel(): void;
   demolish(): void;
@@ -38,6 +43,14 @@ export interface KeyCommands {
   /** Taste eines Gebäudes im Baumenü. */
   build(type: BuildingType): void;
 }
+
+/** Alt + Pfeiltasten. Drehen nur einmal je Druck, Neigen auch beim Gedrückthalten. */
+const ANGLE_KEYS: Record<string, (c: KeyCommands) => void> = {
+  arrowup: (c) => c.tiltStep(1),
+  arrowdown: (c) => c.tiltStep(-1),
+  arrowright: (c) => c.turn(1),
+  arrowleft: (c) => c.turn(-1),
+};
 
 export class Keyboard {
   private held = new Set<string>();
@@ -76,6 +89,13 @@ export class Keyboard {
     if (e.key === 'F3') {
       e.preventDefault();
       c.togglePause();
+      return;
+    }
+    // Alt (Option, AltGr) + Pfeil: neigen und in Vierteln drehen - die Karte
+    // verschiebt sich dabei nicht, der Pfeil zählt darum nicht als gehalten.
+    if (altHeld(e) && ANGLE_KEYS[key]) {
+      e.preventDefault();
+      if (!e.repeat || key === 'arrowup' || key === 'arrowdown') ANGLE_KEYS[key](c);
       return;
     }
     this.held.add(key);

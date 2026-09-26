@@ -39,6 +39,8 @@ const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
  * @param selection was ausgewählt ist - nur das bekommt einen Lebensbalken
  * @param hovered Gebäude unter dem Zeiger (Ankerpunkt) - eine Waffenkammer
  *   zeigt sich dann ohne Dach, wie in Stronghold (ausgewählt ebenso)
+ * @param hideAnimal Tierarten, die nicht gezeichnet werden - weit draußen
+ *   ausgeblendet (Menü → Grafik → Tiere ausblenden)
  */
 export function worldInstances(
   world: World,
@@ -47,6 +49,7 @@ export function worldInstances(
   blend = 1,
   selection?: { villagers: ReadonlySet<number>; buildings: ReadonlySet<string> },
   hovered?: string,
+  hideAnimal: (kind: string) => boolean = () => false,
 ): EntityInstance[] {
   const margin = 4;
   const x0 = view.x - margin;
@@ -148,6 +151,7 @@ export function worldInstances(
     out.push(figure, ...figureProps(figure));
   }
   for (const a of world.wildlife.animals) {
+    if (hideAnimal(a.definition.type)) continue;
     const { x, y } = a.positionAt(blend);
     if (x < x0 || x > x1 || y < y0 || y > y1) continue;
     const def = a.definition;

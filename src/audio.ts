@@ -4,7 +4,8 @@
 // jeder Axthieb klingt ein wenig anders.
 //
 // Browser erlauben Ton erst nach einer Nutzeraktion - der AudioContext wird
-// darum beim ersten Klick oder Tastendruck angelegt.
+// darum beim ersten Klick oder Tastendruck angelegt und bei jedem weiteren
+// fortgesetzt, falls der Browser ihn angehalten hat.
 
 export type SoundName =
   | 'chop' // Axthieb
@@ -40,8 +41,15 @@ export class Sound {
       this.ensure();
       if (this.ctx?.state === 'suspended') void this.ctx.resume();
     };
-    window.addEventListener('pointerdown', unlock);
-    window.addEventListener('keydown', unlock);
+    // In der Capture-Phase, damit kein stopPropagation sie verschluckt; click
+    // und touchend für Safari, das pointerdown nicht immer als Aktion zählt.
+    for (const type of ['pointerdown', 'keydown', 'click', 'touchend']) {
+      window.addEventListener(type, unlock, { capture: true });
+    }
+    // Zurück aus dem Browser-Cache: der Context kann dabei angehalten worden sein.
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted && this.ctx?.state !== 'running') void this.ctx?.resume();
+    });
   }
 
   get enabled(): boolean {

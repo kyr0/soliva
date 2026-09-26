@@ -40,6 +40,11 @@ export class Deposits {
   private berryBushes = new Map<string, { total: number; picked: number }>();
   /** Gefällte Bäume: wann (Weltzeit) und wohin sie fielen. */
   private felled = new Map<string, { at: number; dir: number }>();
+  /**
+   * Zählt hoch, sobald ein Tile angefasst wird (angebaut, gefällt) oder wieder
+   * ganz frei ist - die Anzeige baut dann ihre festen Puffer neu (resources.ts).
+   */
+  revision = 0;
 
   constructor(private terrain: Terrain) {}
 
@@ -110,7 +115,14 @@ export class Deposits {
     const k = key(x, y);
     if (this.felled.has(k)) return false;
     this.felled.set(k, { at: now, dir });
+    this.revision++;
     return true;
+  }
+
+  /** Alle angefassten Tiles: angebaut, gepflückt oder gefällt. */
+  *touched(): Iterable<string> {
+    yield* this.harvested.keys();
+    for (const k of this.felled.keys()) if (!this.harvested.has(k)) yield k;
   }
 
   /**
@@ -122,7 +134,9 @@ export class Deposits {
     if (!found.type) return 0;
     const take = Math.min(amount, found.amount);
     const k = key(x, y);
-    const taken = (this.harvested.get(k) ?? 0) + take;
+    const before = this.harvested.get(k);
+    if (before === undefined) this.revision++;
+    const taken = (before ?? 0) + take;
     this.harvested.set(k, taken);
     if (found.type === 'berries') {
       const total = this.berryBushes.get(k)?.total ?? found.amount + taken - take;
@@ -146,6 +160,7 @@ export class Deposits {
         this.harvested.delete(k);
         this.berryBushes.delete(k);
         this.exhausted.delete(k);
+        this.revision++;
       } else {
         this.harvested.set(k, taken);
         if (taken < total - 1) this.exhausted.delete(k);
@@ -161,6 +176,7 @@ export class Deposits {
    * schon, ohne noch einmal umzufallen; die Richtung ergibt sich aus der Lage.
    */
   restore(harvested: Record<string, number>) {
+    this.revision++;
     for (const [k, amount] of Object.entries(harvested)) {
       this.harvested.set(k, amount);
       const comma = k.indexOf(',');

@@ -21,11 +21,13 @@ import { TERRAIN_PARAMS } from '../noise';
 export const Z_SCREEN = Math.sqrt(6) / 2;
 
 /**
- * Blickwinkel über dem Horizont (Radiant). Im Spiel immer 30° wie in AoE2 -
- * nur die Galerie neigt die Kamera, um Modelle auch von oben oder flach von
- * der Seite zu zeigen. Daraus folgen zwei Maße: wie stark der Boden
- * senkrecht gestaucht wird (groundV, bei 30° genau 1/2) und wie hoch eine
- * senkrechte Tile-Länge im Bild ist (zScreen, bei 30° genau Z_SCREEN).
+ * Blickwinkel über dem Horizont (Radiant). Im Spiel anfangs 30° wie in AoE2;
+ * mit Alt und rechter Maustaste bzw. Alt und Pfeiltasten lässt er sich
+ * zwischen TILT_MIN und TILT_MAX neigen. Die Galerie neigt die Kamera
+ * weiter, um Modelle auch von oben oder flach von der Seite zu zeigen.
+ * Daraus folgen zwei Maße: wie stark der Boden senkrecht gestaucht wird
+ * (groundV, bei 30° genau 1/2) und wie hoch eine senkrechte Tile-Länge im
+ * Bild ist (zScreen, bei 30° genau Z_SCREEN).
  */
 let elevation = Math.PI / 6;
 let groundV = 0.5;
@@ -34,6 +36,27 @@ let zScreen = Z_SCREEN;
 export function viewElevation(): number {
   return elevation;
 }
+
+/** Senkrechte Stauchung des Bodens beim jetzigen Blickwinkel (sin(elevation)). */
+export function viewGroundV(): number {
+  return groundV;
+}
+
+/** Bildhöhe einer senkrechten Tile-Länge beim jetzigen Blickwinkel, in Einheiten von v. */
+export function viewZScreen(): number {
+  return zScreen;
+}
+
+/** Blickwinkel im Spiel: Vorgabe wie in AoE2 und wie weit man neigen kann. */
+export const TILT_DEFAULT = Math.PI / 6;
+export const TILT_MIN = (20 * Math.PI) / 180;
+export const TILT_MAX = (70 * Math.PI) / 180;
+/**
+ * zScreen beim flachsten Blickwinkel im Spiel - das Höchste, was die Gipfel
+ * von unten ins Bild ragen können. Der Gelände-Cache richtet seine Größe
+ * danach, damit er beim Neigen nicht neu angelegt werden muss.
+ */
+export const Z_SCREEN_MAX = Math.SQRT2 * Math.cos(TILT_MIN);
 
 /** Blickwinkel setzen - zwischen fast waagerecht und fast senkrecht. */
 export function setViewElevation(rad: number) {
@@ -52,6 +75,21 @@ export interface GpuCamera {
   centerY: number;
   /** Geräte-Pixel je Einheit von u bzw. v. */
   pixelsPerTile: number;
+  /**
+   * Maßstab des Gelände-Caches, falls er vom Bild abweicht: beim weichen
+   * Zoomen bleibt der Cache auf der nächstkleineren Zoomstufe und wird nur
+   * gestreckt, statt je Bild neu berechnet zu werden. Ohne Angabe wie
+   * pixelsPerTile.
+   */
+  cachePixelsPerTile?: number;
+  /** Maßstäbe, für die der Gelände-Cache im Hintergrund vorberechnet wird (kleinere Zoomstufen). */
+  prefetchPixelsPerTile?: number[];
+  /**
+   * Bodenstauchung (groundV), für die der Gelände-Cache berechnet ist, falls
+   * sie vom jetzigen Blickwinkel abweicht: beim Neigen bleibt der Cache stehen
+   * und wird nur senkrecht gestreckt. Ohne Angabe der jetzige Blickwinkel.
+   */
+  cacheGroundV?: number;
   /** 1 = volles Relief, 0 = flach (Minimap). */
   reliefScale: number;
 }
@@ -196,8 +234,8 @@ export function visibleWorldRect(view: IsoView) {
   const corners = [
     groundToWorld(-hu, -hv),
     groundToWorld(hu, -hv),
-    groundToWorld(-hu, hv + Z_SCREEN * MAX_RELIEF),
-    groundToWorld(hu, hv + Z_SCREEN * MAX_RELIEF),
+    groundToWorld(-hu, hv + zScreen * MAX_RELIEF),
+    groundToWorld(hu, hv + zScreen * MAX_RELIEF),
   ];
   const xs = corners.map((c) => c.x);
   const ys = corners.map((c) => c.y);
@@ -222,7 +260,7 @@ export function panDelta(tileSize: number, dx: number, dy: number) {
  * Gelände ab.
  */
 export function depthRange(camera: GpuCamera, heightPx: number): number {
-  return heightPx / 2 / camera.pixelsPerTile + 3 * Z_SCREEN * MAX_RELIEF + 8;
+  return heightPx / 2 / camera.pixelsPerTile + 3 * zScreen * MAX_RELIEF + 8;
 }
 
 /**
@@ -251,13 +289,17 @@ export function setViewUniforms(gl: WebGL2RenderingContext, location: (name: str
   gl.uniform1f(location('uZScreen'), zScreen);
 }
 
-/** Kamera-Uniforms für PROJECT_GLSL. */
+/**
+ * Kamera-Uniforms für PROJECT_GLSL.
+ * @param size Größe der Zeichenfläche - sonst das Canvas (z. B. ein Ausschnitt eines Framebuffers)
+ */
 export function setCameraUniforms(
     gl: WebGL2RenderingContext,
     location: (name: string) => WebGLUniformLocation | null,
     camera: GpuCamera,
+    size: { width: number; height: number } = gl.canvas,
 ) {
-  const { width, height } = gl.canvas;
+  const { width, height } = size;
   gl.uniform2f(location('uResolution'), width, height);
   const g = worldToGround(camera.centerX, camera.centerY);
   gl.uniform2f(location('uCameraGround'), g.u, g.v);

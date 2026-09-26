@@ -109,6 +109,14 @@
   font-size: 11px;
   color: var(--cream-muted);
 }
+/* Kurzer Hinweis unter einer Einstellung (Grafik). */
+#menu .menu-hint {
+  margin: 2px 0 8px;
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1.4;
+  color: var(--cream-muted);
+}
 /* Regler rechtsbündig vor ihrer Zahl, alle gleich breit. */
 #menu input[type='range'] {
   width: 170px;

@@ -335,13 +335,23 @@ const sides = (r: number) => (r > 0.24 ? 16 : r > 0.14 ? 12 : r > 0.07 ? 9 : r >
  * nicht mehr sichtbar und die Rinde läuft glatt durch.
  */
 function barkTube(m: Model, mtl: Material, skeleton: Skeleton, chain: readonly number[],
-  dist0: number, uOff: number, tile: number, caps: { readonly bottom: boolean; readonly top: boolean }) {
+  dist0: number, uOff: number, tile: number, caps: { readonly bottom: boolean; readonly top: boolean },
+  cut: { readonly from?: StumpCut; readonly to?: StumpCut; readonly name?: string } = {}) {
   const segs = chain.map((i) => skeleton.segments[i]);
-  const pts: Vec3[] = [segs[0].a, ...segs.map((s) => s.b)];
+  const pts: Vec3[] = [cut.from?.p ?? segs[0].a, ...segs.map((s) => s.b)];
+  const radii = [cut.from?.r ?? skeleton.radii[chain[0]][0], ...chain.map((i) => skeleton.radii[i][1])];
+  // Nur ein Stück am Anfang (der Stumpf): bis zum Schnitt statt bis zum Segmentende.
+  if (cut.to) {
+    pts[pts.length - 1] = cut.to.p;
+    radii[radii.length - 1] = cut.to.r;
+  }
   const dirs = segs.map((s) => normalize(add(s.b, s.a, -1)));
   const joints = pts.map((_, j): Vec3 =>
     (j === 0 ? dirs[0] : j === dirs.length ? dirs[j - 1] : normalize(add(dirs[j - 1], dirs[j], 1))));
-  const radii = [skeleton.radii[chain[0]][0], ...chain.map((i) => skeleton.radii[i][1])];
+  // Am Schnitt liegt der Ring waagerecht - das Spiel erkennt die Schnittfläche
+  // daran, dass sie genau in der Höhe des Stumpfs liegt.
+  if (cut.from) joints[0] = [0, 1, 0];
+  if (cut.to) joints[joints.length - 1] = [0, 1, 0];
   const n = sides(radii[0]);
 
   // Startrahmen wie bei beam(), danach je Gelenk mitgedreht.
@@ -391,7 +401,55 @@ function barkTube(m: Model, mtl: Material, skeleton: Skeleton, chain: readonly n
   };
   if (caps.bottom) cap(0, [-joints[0][0], -joints[0][1], -joints[0][2]], true);
   if (caps.top) cap((pts.length - 1) * (n + 1), joints[pts.length - 1], false);
-  m.mesh(radii[0] > 0.12 ? 'Trunk' : 'Branch', mtl, vertices, faces, uvs, normals);
+  m.mesh(cut.name ?? (radii[0] > 0.12 ? 'Trunk' : 'Branch'), mtl, vertices, faces, uvs, normals);
+}
+
+/** Höhe des Baumstumpfs über dem Boden in Metern - dort sägen die Dorfbewohner ab. */
+const STUMP_HEIGHT = 0.5;
+/** Dünner am Boden (Halbmesser, Meter) ist kein Stamm, sondern ein Halm - kein Stumpf. */
+const STUMP_MIN_RADIUS = 0.05;
+
+/** Punkt und Halbmesser am Schnitt zwischen Stumpf und Stamm. */
+interface StumpCut {
+  readonly p: Vec3;
+  readonly r: number;
+}
+
+/**
+ * Der Baumstumpf: Vom Fuß des Stamms (das dickste Stück, das am Boden
+ * beginnt) geht es jeweils ins dickste Kind nach oben, bis ein Stück
+ * STUMP_HEIGHT erreicht - dort wird geschnitten. `below`: die Stücke ganz
+ * unter dem Schnitt, `seg`: das Stück mit dem Schnitt. null, wenn der Stamm
+ * nicht deutlich höher reicht oder zu dünn ist (Getreide, Gräser). Das Spiel
+ * erkennt den Stumpf am Namen `Trunk.Stump`.
+ */
+function findStump(skeleton: Skeleton): { below: Set<number>; seg: number; cut: StumpCut } | null {
+  const { segments, radii } = skeleton;
+  let i = -1;
+  segments.forEach((s, k) => {
+    if (s.parent < 0 && Math.abs(s.a[1]) < 1e-6 && (i < 0 || radii[k][0] > radii[i][0])) i = k;
+  });
+  if (i < 0 || radii[i][0] < STUMP_MIN_RADIUS) return null;
+  const below = new Set<number>();
+  while (i >= 0) {
+    const s = segments[i];
+    if (s.b[1] >= STUMP_HEIGHT) {
+      // Deutlich höher als der Stumpf, sonst lohnt kein Schnitt.
+      let top = s.b[1];
+      for (let k = 0; k < segments.length; k++) top = Math.max(top, segments[k].b[1]);
+      if (top < STUMP_HEIGHT * 1.5 || s.b[1] - s.a[1] <= 1e-6) return null;
+      const t = (STUMP_HEIGHT - s.a[1]) / (s.b[1] - s.a[1]);
+      const [r0, r1] = radii[i];
+      return { below, seg: i, cut: { p: add(s.a, add(s.b, s.a, -1), t), r: r0 + (r1 - r0) * t } };
+    }
+    below.add(i);
+    let next = -1;
+    segments.forEach((c, k) => {
+      if (c.parent === i && (next < 0 || radii[k][0] > radii[next][0])) next = k;
+    });
+    i = next;
+  }
+  return null;
 }
 
 /** Wie das Laub gebaut wird. */
@@ -418,10 +476,20 @@ export function build(skeleton: Skeleton, spec: TreeSpec, rnd: () => number, { l
   const texture = barkFor(spec.stemMaterial, spec.barkTexture);
   const bark = texture ? { material: spec.stemMaterial, texture } : null;
   const { segments } = skeleton;
+  const stump = findStump(skeleton);
   if (!bark) {
     segments.forEach((s, i) => {
       const [r0, r1] = skeleton.radii[i];
-      m.beam(r0 > 0.12 ? 'Trunk' : 'Branch', spec.stemMaterial, s.a, s.b, r0 * 2, { w1: r1 * 2, n: sides(r0) });
+      const name = r0 > 0.12 ? 'Trunk' : 'Branch';
+      if (stump?.below.has(i)) {
+        m.beam('Trunk.Stump', spec.stemMaterial, s.a, s.b, r0 * 2, { w1: r1 * 2, n: sides(r0) });
+      } else if (stump?.seg === i) {
+        const { cut } = stump;
+        m.beam('Trunk.Stump', spec.stemMaterial, s.a, cut.p, r0 * 2, { w1: cut.r * 2, n: sides(r0) });
+        m.beam(name, spec.stemMaterial, cut.p, s.b, cut.r * 2, { w1: r1 * 2, n: sides(r0) });
+      } else {
+        m.beam(name, spec.stemMaterial, s.a, s.b, r0 * 2, { w1: r1 * 2, n: sides(r0) });
+      }
     });
   } else {
     // Weg vom Boden und u-Versatz je Ast: Kinder setzen die Abwicklung des
@@ -456,8 +524,21 @@ export function build(skeleton: Skeleton, spec: TreeSpec, rnd: () => number, { l
       const chain = [i];
       for (let j = mainChild[i]; j >= 0 && continues(j); j = mainChild[j]) chain.push(j);
       const last = chain[chain.length - 1];
+      const k = stump ? chain.indexOf(stump.seg) : -1;
+      if (stump && k >= 0) {
+        // Der Stumpf: bis zum Schnitt, oben zu. Darüber der Stamm mit eigener
+        // Unterseite am Schnitt; die Rinde läuft durch.
+        const { cut } = stump;
+        const up = chain.slice(k);
+        const cutDist = dist[stump.seg] + length(add(cut.p, segments[stump.seg].a, -1));
+        barkTube(m, spec.stemMaterial, skeleton, chain.slice(0, k + 1), dist[i], uOff[i], tile,
+          { bottom: s.parent < 0, top: true }, { to: cut, name: 'Trunk.Stump' });
+        barkTube(m, spec.stemMaterial, skeleton, up, cutDist, uOff[i], tile,
+          { bottom: true, top: !hasChild[last] }, { from: cut });
+        return;
+      }
       barkTube(m, spec.stemMaterial, skeleton, chain, dist[i], uOff[i], tile,
-        { bottom: s.parent < 0, top: !hasChild[last] });
+        { bottom: s.parent < 0, top: !hasChild[last] }, stump?.below.has(i) ? { name: 'Trunk.Stump' } : {});
     });
   }
   const foliage: Organ = {

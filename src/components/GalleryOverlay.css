@@ -112,6 +112,14 @@
   color: var(--cream);
   text-shadow: 2px 2px 0 #000;
 }
+.gal-file {
+  font: 13px ui-monospace, Menlo, monospace;
+  color: var(--cream);
+  opacity: 0.8;
+  text-shadow: 1px 1px 0 #000;
+  user-select: text;
+  pointer-events: auto;
+}
 .gal-chips,
 .gal-rotate {
   display: flex;

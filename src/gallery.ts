@@ -396,7 +396,7 @@ let current = 0;
 let animation = 0;
 let demolishing = false;
 
-const { canvas, labels: labelEls, titles: titleEls, show } = mountGallery(
+const { canvas, labels: labelEls, titles: titleEls, show, files } = mountGallery(
   document.getElementById('app')!,
   SHOWCASE,
   placed.map((p) => p.item.label),
@@ -625,6 +625,7 @@ function frame(now: number) {
     const s = SHOWCASE[current];
     (demolishing && s.demolish ? s.demolish[animation] : s.exhibits[animation]).draw(t, 0, 0, instances);
     spinAll(instances, spin);
+    files([...new Set(instances.map((e) => renderer.modelFile(e.shape)).filter((f) => f !== undefined))]);
   }
 
   gl.viewport(0, 0, canvas.width, canvas.height);

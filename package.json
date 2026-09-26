@@ -24,5 +24,8 @@
   },
   "dependencies": {
     "defuss": "^3.4.9"
-  }
+  },
+  "trustedDependencies": [
+    "@swc/core"
+  ]
 }

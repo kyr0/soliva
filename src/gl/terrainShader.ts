@@ -42,6 +42,7 @@ uniform float uTundraTemperature;
 uniform float uReliefHeight;
 uniform float uReliefExponent;
 uniform float uLowlandRelief;
+uniform float uLowlandShade;
 uniform float uMountainFoot;
 
 // Ebenen in der Permutations-Textur (Reihenfolge = NOISE_LAYERS)
@@ -199,6 +200,19 @@ uniform vec2 uCacheSize;    // Texturgroesse in Texeln
 `;
 
 /**
+ * Nur beim Zeichnen: Texel je u/v-Einheit - beim weichen Zoomen ungleich
+ * uPixelsPerTile. Dazu der alte Cache, der beim Wechsel der Zoomstufe
+ * stehen bleibt, bis der neue fertig ist (siehe TerrainRenderer.previous).
+ */
+const CACHE_SCALE_GLSL = `
+uniform float uCacheScale;
+uniform float uCacheStretch;     // Bodenstauchung des Caches / jetzige (Neigen)
+uniform vec2  uPrevWindowStart;  // (u, v) der Fenster-Ecke des alten Caches
+uniform float uPrevCacheScale;   // seine Texel je u/v-Einheit
+uniform float uPrevStretch;      // seine Bodenstauchung / jetzige
+`;
+
+/**
  * Das Gelände ist ein Gitter, das auf dem Bildschirm gleichmäßig liegt (in
  * Boden-Koordinaten u/v, siehe iso.ts). Jeder Eckpunkt wird ins Weltsystem
  * zurückgerechnet und um seine Höhe angehoben. Die Eckpunkte hängen am
@@ -218,9 +232,11 @@ uniform vec2  uGridOrigin;  // (u, v) des ersten Eckpunkts
 uniform float uGridCell;    // Zellgroesse in u/v-Einheiten
 uniform int   uGridColumns;
 ${CACHE_GLSL}
+${CACHE_SCALE_GLSL}
 
 out vec2 vWorld;
 out vec2 vCache;            // normierte Koordinate im Farb-Cache
+out vec2 vPrevTexel;        // Texel im alten Cache ab seiner Fenster-Ecke
 
 void main() {
   int col = gl_VertexID % uGridColumns;
@@ -239,7 +255,9 @@ void main() {
   vWorld = world;
   // Ringpuffer: Texturkoordinaten laufen ueber den Rand hinaus, REPEAT
   // faltet sie zurueck.
-  vCache = ((g - uWindowStart) * uPixelsPerTile + uWindowMod) / uCacheSize;
+  // Beim Neigen liegt der Cache in seiner eigenen Stauchung: nur v streckt sich.
+  vCache = ((vec2(g.x, g.y * uCacheStretch) - uWindowStart) * uCacheScale + uWindowMod) / uCacheSize;
+  vPrevTexel = (vec2(g.x, g.y * uPrevStretch) - uPrevWindowStart) * uPrevCacheScale;
   gl_Position = project(world, z);
 }
 `;
@@ -275,6 +293,9 @@ ${CACHE_GLSL}
  * feiner und die Biom-Ränder fangen an zu grieseln.
  */
 uniform float uDetailPixels;
+// Ab so vielen Geräte-Pixeln je Tile stehen die Blumen als 3D-Objekte in der
+// Wiese (world/flowers.ts) - dann malt das Gelände sie nicht mehr.
+uniform float uFlowerObjectPixels;
 // Nur für den Abgleich mit der CPU-Fassung: 1 = Höhe, 2 = Hangneigung,
 // jeweils als 16-Bit-Wert über R und G gepackt.
 uniform int uDebug;
@@ -465,7 +486,7 @@ vec3 grassTexture(vec3 c, vec2 tile, float ds, float moisture, float bloom) {
   c *= 1.0 + max(blades, 0.0) * 0.06;
   float worn = smoothstep(0.62, 0.8, snoise(L_MICRO, tile * 0.18 + vec2(55.0, 91.0)));
   c = mix(c, vec3(0.48, 0.40, 0.28) * (0.92 + 0.16 * blades), worn * 0.5);
-  if (bloom > 0.0) {
+  if (bloom > 0.0 && uPixelsPerTile < uFlowerObjectPixels) {
     float shadow;
     vec4 f = flower(tile, ds, bloom, shadow);
     c *= 1.0 - shadow * 0.35;
@@ -958,7 +979,9 @@ void main() {
   float hRight = elevation((tile + vec2(step, 0.0)) * uMapScale, detailStep);
   float hDown = elevation((tile + vec2(0.0, step)) * uMapScale, detailStep);
   float shade = tanh(((height - hRight) + (height - hDown)) * uShadeGain / step);
-  color *= 1.0 + shade * (isWater ? 0.08 : mix(0.42, 0.18, sandy));
+  // Im Flachland gedämpft, sonst zeichnet sie jede kleine Welle der Wiese nach.
+  float lowland = mix(uLowlandShade, 1.0, smoothstep(uMountainFoot - 0.15, uMountainFoot, height));
+  color *= 1.0 + shade * (isWater ? 0.08 : mix(0.42, 0.18, sandy) * lowland);
 
   // Licht auf das Relief. Die Hangneigung oben ist nur ein Schattierungs-
   // effekt der Hoehenwerte; hier zaehlt die Neigung der tatsaechlich
@@ -999,9 +1022,17 @@ precision highp float;
 
 in vec2 vWorld;
 in vec2 vCache;
+in vec2 vPrevTexel;
 out vec4 fragColor;
 
 uniform sampler2D uCache;
+// Alter Cache beim Wechsel der Zoomstufe: Anteil (0 = aus), Lage im
+// Ringpuffer und der fertige Bereich (Texel ab Fenster-Ecke: u0, v0, u1, v1).
+uniform sampler2D uCachePrev;
+uniform float uPrevMix;
+uniform vec2  uPrevWindowMod;
+uniform vec2  uPrevCacheSize;
+uniform vec4  uPrevReady;
 uniform vec2  uResolution;
 uniform float uPixelsPerTile;
 
@@ -1054,6 +1085,10 @@ void main() {
   float step = 1.0 / uPixelsPerTile;
   vec2 tile = vWorld;
   vec3 color = texture(uCache, vCache).rgb;
+  if (uPrevMix > 0.0 && all(greaterThanEqual(vPrevTexel, uPrevReady.xy)) && all(lessThan(vPrevTexel, uPrevReady.zw))) {
+    vec3 before = texture(uCachePrev, (vPrevTexel + uPrevWindowMod) / uPrevCacheSize).rgb;
+    color = mix(color, before, uPrevMix);
+  }
 
   if (uFieldActive > 0.5) {
     vec2 ft = floor(vWorld - uFieldOrigin);
